@@ -1,0 +1,90 @@
+---
+title: "SDH inhibition snMultiome RNA & ATAC-seq"
+author: "Dakota Nuttall"
+date: "2025-06-17"
+R-version: 4.3.3
+---
+
+###GO Analysis###
+```{r echo=TRUE}
+set.seed(1234)
+library(clusterProfiler)
+library(dplyr)
+library(readxl)
+library(ggplot2)
+library(openxlsx)
+library(stringr)
+```
+####  Load data  ####
+
+```{r echo=TRUE}
+GOcluster<- read.xlsx("aggregated_Cardiomyocytes_DEGs.xlsx")# or "aggregated_Cardiac_Fibroblasts_DEGs.xlsx" for CFs
+GOfile <- GOcluster[GOcluster$cluster == "CM3",] # repeat for CM2, CF2 and CF3
+#or GOfile <- CF3_marker_sub
+
+#upregulated genes
+GOfile<- subset(GOfile, avg_log2FC > 0)
+##OR##
+#downregulated genes
+GOfile<- subset(GOfile, avg_log2FC < 0)
+
+GO_vec <- as.vector(GOfile$gene)
+```
+#Perform GO analysis
+```{r echo=TRUE}
+CT_GO<- enrichGO(gene = GOfile$gene,OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP")
+CT_GO.df <- as.data.frame(CT_GO)
+CT_GO.df$log10p.adjusted <- -log10(CT_GO.df$p.adjust)
+CT_GO.df$labels <- paste(CT_GO.df$Description,CT_GO.df$ID)
+
+# Create a new column for the wrapped labels
+CT_GO.df$labels_wrapped <- NA
+
+# Apply the custom function to each row using a for loop
+for (i in 1:nrow(CT_GO.df)) {
+  CT_GO.df$labels_wrapped[i] <- split_into_two_lines(CT_GO.df$labels[i])
+}
+
+write.xlsx(CT_GO.df,"CM3_GO_upregulated.xlsx") #repeat for downregulated
+# repeat for CM2, CF2 and CF3
+```
+##Identify unique Go Terms (optional)
+```{r echo=TRUE}
+
+CT_GO.df_CM3_up <- read.xlsx("CM3_GO_upregulated.xlsx")
+CT_GO.df_CM3_down <- read.xlsx("CM3_GO_downregulated.xlsx")
+
+CT_GO.df_CM3_up_filtered <- dplyr::filter(CT_GO.df_CM3_up, !Description %in% CT_GO.df_CM3_down$Description)
+CT_GO.df_CM3_down_filtered <- dplyr::filter(CT_GO.df_CM3_down, !Description %in% CT_GO.df_CM3_up$Description)
+
+#Repeat for other clusters; can also be used to compare clusters 
+
+```
+##Select GO Terms
+```{r echo=TRUE}
+CM2_up_terms <- c('cardiac muscle hypertrophy','cell-matrix adhesion','extracellular matrix organization','negative regulation of growth','cardiac muscle hypertrophy in response to stress','Ras protein signal transduction','positive regulation of extrinsic apoptotic signaling pathway','positive regulation of extrinsic apoptotic signaling pathway')
+
+CM3_up_terms <- c('muscle organ development','sarcomere organization','Wnt signaling pathway','negative regulation of anoikis','response to oxidative stress','positive regulation of chromosome organization','muscle cell proliferation','reactive oxygen species metabolic process')
+
+CF3_GO_upregulated_TERMS <- c("regulation of mRNA metabolic process","nucleocytoplasmic transport","RNA splicing","cell-substrate adhesion", "regulation of cell morphogenesis", "positive regulation of growth","heterochromatin formation","positive regulation of Wnt signaling pathway")
+
+CF3_GO_downregulated_TERMS <- c('negative regulation of cellular senescence','extracellular matrix assembly','replacement ossification','negative regulation of Wnt signaling pathway','cell-matrix adhesion','negative regulation of growth','stress fiber assembly','muscle cell differentiation')
+
+CF2_GO_upregulated_TERMS <-c("extracellular matrix organization","connective tissue development","actin filament organization","muscle cell development","cell-matrix adhesion","cell-substrate junction organization","negative regulation of growth","wound healing involved in inflammatory response")
+
+CF2_GO_downregulated_TERMS <-c('regulation of angiogenesis','negative regulation of MAPK cascade','response to oxidative stress','negative regulation of ERK1 and ERK2 cascade','interleukin-6 production','reactive oxygen species metabolic process','regeneration','canonical Wnt signaling pathway')
+
+```
+## Plot GO terms
+```{r echo=TRUE}
+ggplot(CT_GO.df[CT_GO.df$Description %in% CM3_GO_upregulated_TERMS,], aes(x=log10p.adjusted, y= reorder(labels_wrapped,log10p.adjusted), color = qvalue,  size=Count)) +
+  geom_point() +
+  labs(title = "CM3 upregulated genes", x = "-10log[p.adjusted]", y = "") + scale_color_gradient(low="red", high="blue") +
+  theme(text = element_text(size=16))
+#write.csv(CT_GO.df, "SalMI Immune GO.csv")
+
+ggsave("CM3 (Malonate MI) upregulated.tiff",height = 5,width = 8)
+
+##Repeat for each cluster
+
+```

@@ -1,0 +1,286 @@
+---
+title: "SDH inhibition snMultiome RNA & ATAC-seq"
+author: "Dakota Nuttall"
+date: "2025-06-17"
+R-version: 4.3.3
+---
+###Global Preparation and Annotation###
+
+```{r echo=TRUE}
+set.seed(1234)
+library(Seurat)
+library(SeuratObject)
+library(Signac)
+library(harmony)
+library(dplyr)
+library(reticulate)
+library(hdf5r)
+library(scales)
+library(ggplot2)
+library(EnhancedVolcano)
+library(openxlsx)
+library(readxl)
+library(GenomeInfoDb)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(org.Mm.eg.db)
+library(JASPAR2024)
+library(TFBSTools)
+library(DropletUtils)
+library(Gviz)
+library(ggpubr)
+```
+####  Load data  ####
+
+```{r echo=TRUE}
+#Load integrated file
+aggregated_samples <- readRDS("aggregated_Integrated.rds")
+
+#optional to reduce file size
+aggregated_samples@assays$ATAC <- NULL
+aggregated_samples@assays$peaks <- NULL
+
+# Re-normalize and perform Harmony batch correction
+aggregated_samples$orig.ident <- factor(x = aggregated_samples$orig.ident, levels = c("Saline_Sham","Malonate_Sham","Saline_MI","Malonate_MI"))
+
+DefaultAssay(aggregated_samples) <- "RNA"
+
+aggregated_samples <- SCTransform(aggregated_samples, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+aggregated_samples <- RunPCA(aggregated_samples, npcs = 50)
+aggregated_samples <- IntegrateLayers(object = aggregated_samples, method = HarmonyIntegration, new.reduction = "harmony_pca", orig.reduction = "pca",)
+VariableFeatures(aggregated_samples) <- rownames(aggregated_samples@assays[["SCT"]]@scale.data)[!grepl(pattern="^mt-|^Rps|^Rpl|^Mrpl|^Mrps",rownames(aggregated_samples@assays[["SCT"]]@scale.data))]
+
+DefaultAssay(aggregated_Filt) <- "SCT"
+
+aggregated_Filt <- RunUMAP(aggregated_Filt, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+
+```
+##Predict doublets using Scrublet and filter them out
+
+```{r echo=TRUE}
+#Join the individual RNA counts into one layer
+DefaultAssay(aggregated_Filt) <- "RNA"
+aggregated_samples <- JoinLayers(aggregated_samples)
+
+#This function creates an RNA count folder that will be analyzed by scrublet in Python
+write10xCounts(path = "agg_counts",x=aggregated_samples@assays$RNA$counts,  overwrite = T)
+
+#This adds the doublet predictions produced by Scrublet as metadata
+aggregated_samples <- AddMetaData(aggregated_samples,read.csv("agg_scrublet_output_table.csv"))
+
+
+Percent_doublet <- sum(aggregated_samples$predicted_doublet=="True")/length(aggregated_samples$predicted_doublet)
+doublet_labels <-  c()
+
+
+#Visualize proportion doublets
+pt <- table(aggregated_samples$predicted_doublet, aggregated_samples$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var2 <- as.character(pt$Var2)
+pt$Var2<- factor(pt$Var2, levels=c("Saline_Sham","Malonate_Sham","Saline_MI","Malonate_MI"))
+p2 <- ggplot(pt, aes(x = Var2, y = Freq, fill = Var1 )) +
+  theme_bw(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Condition") +
+  ylab("Proportion") +
+  theme(legend.title = element_blank(),axis.text=element_text(size=16, face = "bold"),legend.text  = element_text(face="bold", size = 14),axis.title=element_text(size=18,face="bold")) +
+  scale_fill_manual(values = c("skyblue","black"),labels = c("Singlet", "Doublet"))+ theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p2
+ggsave("aggregated_samples_prop.tiff", height = 5,width = 6)
+DimPlot(aggregated_samples, pt.size = .1, reduction = "umap_RNA", group.by = 'predicted_doublet', cols = c("skyblue","black"))+ labs(title = "Filtered Nuclei (5.31%)",)+
+  theme(legend.text  = element_text(face="bold", size = 14), axis.text=element_blank(),axis.ticks=element_blank(), axis.line = element_line(linewidth =  1))+ xlab("UMAP 1") + ylab("UMAP 2") 
+
+##Remove doublets and re-normalize 
+aggregated_samples <- subset(aggregated_samples, predicted_doublet == "False")
+aggregated_samples[["RNA"]] <- split(aggregated_samples[["RNA"]], f = aggregated_samples$orig.ident)
+aggregated_samples <- SCTransform(aggregated_samples,vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+  
+```
+##Perform cluster level level QC to remove low quality clusters
+
+```{r echo=TRUE}
+#Redo UMAP after subsetting  
+DefaultAssay(aggregated_samples) <- "SCT"
+aggregated_samples <- FindNeighbors(object = aggregated_samples, dims = 1:50, reduction = "harmony_pca")
+
+aggregated_samples <- RunUMAP(aggregated_samples, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+
+aggregated_samples <- FindClusters(object = aggregated_samples, resolution = 2)
+
+## Visualize each plot and pick the resolution that works best; We chose 2
+DimPlot(aggregated_samples, reduction = "umap_RNA", label = 'true',group.by = "SCT_snn_res.2")
+DimPlot(aggregated_samples, pt.size = .8, reduction = "umap_RNA", group.by = 'orig.ident')
+
+#Identify and remove low RNA count clusters
+VlnPlot(object = aggregated_samples, features = c( "nCount_RNA"), ncol = 1, pt.size = 0) + NoLegend()
+
+identify_low_RNA_clusters <- function(srt_object= seurat_object){
+  RNA_count <- srt_object@meta.data$nCount_RNA
+  clusters_ids <- levels(srt_object@active.ident)
+  low_RNA_cluster <- c()
+  for (i in clusters_ids){
+    cluster_RNA_median <- median(RNA_count[srt_object@active.ident==i])
+    if(cluster_RNA_median < 1000){
+      low_RNA_cluster <- c(low_RNA_cluster,i)
+    }
+  }
+  return(low_RNA_cluster)
+}
+
+lowRNA <- identify_low_RNA_clusters(aggregated_samples)
+Percent_lowquality <- sum(aggregated_samples@active.ident == lowRNA)/length(aggregated_samples@active.ident)
+#0.0311
+
+DimPlot(aggregated_samples,reduction = 'umap_RNA', pt.size = .1, cells.highlight = WhichCells(aggregated_samples,idents = lowRNA),cols.highlight = "black",sizes.highlight = .1)+ theme(legend.position="bottom",axis.text=element_blank(),axis.ticks=element_blank(), axis.line = element_line(linewidth =  1),axis.title=element_text(size=16,face="bold")) + labs(title )+
+  theme(legend.text  = element_text(face="bold", size = 14)) + xlab("UMAP 1") + ylab("UMAP 2")+
+  scale_color_manual(labels = c("High-quality", "Low-quality"), values = c("grey", "black"))
+ggsave("LowUMI_umap.tiff", height = 5,width = 5)
+
+aggregated_samples <- subset(aggregated_samples, idents = lowRNA, invert =  T)
+DefaultAssay(aggregated_samples) <- "RNA"
+aggregated_samples[["RNA"]] <- split(aggregated_samples[["RNA"]], f = aggregated_samples$orig.ident)
+aggregated_samples <- SCTransform(aggregated_samples,vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+DefaultAssay(aggregated_samples) <- "SCT"
+
+```
+##Define cell types
+```{r echo=TRUE}
+
+ElbowPlot(aggregated_samples, ndims = 100, reduction = "pca")
+aggregated_samples <- FindNeighbors(object = aggregated_samples,reduction = "harmony_pca", dims = 1:50)
+
+aggregated_samples <- RunUMAP(aggregated_samples, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+aggregated_samples <- FindClusters(object = aggregated_samples, resolution = seq(.1, 1, 0.1), algorithm = 3 )
+
+## Visualize each plot and pick the resolution that works best; We chose 0.3 as it was needed to visualize Schwann cells
+DimPlot(aggregated_samples, reduction = "umap_RNA", label = 'true',group.by = "SCT_snn_res.0.3")
+DimPlot(aggregated_samples, pt.size = .8, reduction = "umap_RNA", group.by = 'orig.ident')
+
+DefaultAssay(aggregated_samples) <- "SCT"
+aggregated_samples <- PrepSCTFindMarkers(aggregated_samples, assay = "SCT",verbose = T)
+
+#Reference dataframe obtained from our collaborators from the Xiao Li lab
+reference_db <- read.csv("PART90.01.01.table.global_cell_type_RNA_marker.csv")
+
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+aggregated.markers <- FindAllMarkers(aggregated_samples, only.pos = TRUE, logfc.threshold = 1, return.thresh = 0.1, min.pct = 0.5, test.use = "MAST")
+
+aggregated.markers <- subset(aggregated.markers, p_val_adj < 0.05)
+
+assigned_cell_types <- data.frame()
+
+for (cluster_id in unique(aggregated.markers$cluster)) {
+  cluster_markers <- subset(aggregated.markers, cluster == cluster_id)$gene
+  cluster_cell_types <- reference_db$Cell_type[match(cluster_markers, reference_db$Gene_symbol, nomatch = NA)]
+  cluster_assignment <- data.frame(Cluster = cluster_id, CellType = cluster_cell_types, Gene = cluster_markers)
+  assigned_cell_types <- rbind(assigned_cell_types, cluster_assignment)
+}
+
+aggregated.anno <- cbind(aggregated.markers,assigned_cell_types$CellType)
+
+write.csv(aggregated.anno,file = "aggregated.anno.csv")
+
+#filter markers
+aggregated.anno <- read.csv("aggregated.anno.csv")
+aggregated.anno_filtered <- na.omit(aggregated.anno)
+clustergenes <-aggregated.anno_filtered %>%
+  group_by(cluster) %>%
+  slice_min(n = 10, order_by =p_val_adj)
+
+write.csv(clustergenes,file = "clustergenes.csv")
+
+cell_types <- c("CF","EC","Mural","Mye","CM","EC","EC","EC","EC","EpiC","CF","CM","EC","Lym","Lym","Mural","Schwann")
+aggregated_samples@active.ident<-factor(aggregated_samples@active.ident, labels = cell_types)
+
+#Use this to figure out current order of clusters
+table(aggregated_samples@active.ident)
+
+cell_types <- c("Cardiac Fibroblasts","Endothelial Cells","Mural Cells","Myeloid Cells","Cardiomyocytes","Epicardial Cells","Lymphoid Cells","Schwann Cells")
+
+aggregated_samples@active.ident<-factor(aggregated_samples@active.ident, labels = cell_types, )
+
+#Reorder levels
+Aggregated_cell_levels <- c("Cardiomyocytes","Cardiac Fibroblasts","Endothelial Cells","Mural Cells","Myeloid Cells","Epicardial Cells","Lymphoid Cells","Schwann Cells")
+aggregated_samples@active.ident<-factor(aggregated_samples@active.ident, levels = Aggregated_cell_levels)
+
+aggregated_samples$Cell_type <- Idents(aggregated_samples)
+
+DimPlot(aggregated_samples, reduction = "umap_RNA", label = 'true', repel = T)+ theme(legend.position="bottom") + NoLegend()
+DimPlot(aggregated_samples, pt.size = .8, reduction = "umap_RNA", group.by = 'orig.ident',)+ theme(legend.position="bottom") + labs(title = NULL)
+
+```
+##Normalize ATAC data and perform multimodal weighted nearest neaighbor analysis
+```{r echo=TRUE}
+#NormalizeATAC data
+DefaultAssay(aggregated_samples) <- "peakunion"
+aggregated_samples <- FindTopFeatures(aggregated_samples, min.cutoff = 10)
+aggregated_samples<- RunTFIDF(aggregated_samples)
+aggregated_samples <- RunSVD(aggregated_samples )
+ElbowPlot(aggregated_samples, ndims = 50, reduction = "lsi")
+
+#Perform Harmony on ATAC data
+aggregated_samples <- RunHarmony(aggregated_samples, 
+                              group.by.vars = "orig.ident",
+                              reduction = "lsi", assay.use = "peakunion", reduction.save = "harmony_lsi",project.dim= F)
+aggregated_samples <- RunUMAP(object = aggregated_samples, reduction = 'harmony_lsi', dims = 2:50, reduction.name = "umap_ATAC", reduction.key = "ATACUMAP")
+
+DimPlot(aggregated_samples, reduction = "umap_ATAC", label = 'true') 
+DimPlot(aggregated_samples,reduction = "umap_ATAC", group.by = "orig.ident")
+
+# build a WNN neighbor graph using both assays
+DefaultAssay(aggregated_samples) <- "SCT"
+aggregated_samples <- FindMultiModalNeighbors(
+  object = aggregated_samples,
+  reduction.list = list("harmony_pca", "harmony_lsi"), 
+  dims.list = list(1:50, 2:50),
+  modality.weight.name = c("SCT.weight","ATAC.weight"),
+  verbose = TRUE
+)
+
+# build a WNN UMAP visualization
+aggregated_samples <- RunUMAP(
+  object = aggregated_samples,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNNUMAP",
+  verbose = TRUE
+)
+
+##Visualize
+clust_colors <- c("darkorange2","mediumorchid2","steelblue3","olivedrab","indianred1","hotpink","darkred","green3","grey")
+treatment_colors <-c("lightskyblue","pink", "steelblue4","red3")
+
+#Functions below found in helper functions script
+quick_CT_plot(object = aggregated_samples,pt.size = .1,reduction = "umap_ATAC", legend = F, label = F, font.size = 6)
+quick_cond_plot(object = aggregated_samples,pt.size = .1,reduction = "WNN_umap", legend = F)
+
+
+#Plotbased on treatment condition
+
+Idents(object = aggregated_wnn) <- aggregated_wnn$orig.ident
+
+DimPlot(aggregated_wnn,reduction = 'WNN_umap', group.by = "orig.ident", pt.size = .1, cells.highlight = WhichCells(aggregated_wnn,idents = "Saline_Sham"),cols.highlight = c(treatment_colors[1]))# Change treatment color[1-4] for each condition type
++ theme(legend.position="bottom",axis.text=element_blank(),axis.ticks=element_blank(), axis.line = element_line(linewidth =  1),axis.title=element_text(size=16,face="bold")) + labs(title = NULL)+
+  theme(legend.text  = element_text(face="bold", size = 14)) + xlab("UMAP 1") + ylab("UMAP 2")+ NoLegend()
+ggsave("SalSham_umap_cond.tiff", height = 5,width = 5)
+##REpeat for each treatment condition
+
+Idents(object = aggregated_wnn) <- aggregated_wnn$Cell_type
+
+#Save progress for subclsuter analysis
+saveRDS(aggregated_samples,"aggregated_wnn.rds")
+```
+#####Proceed to analysis of subclusters####
+```{r echo=TRUE}
+
+```
+
+```{r echo=TRUE}
+
+```
+
+```{r echo=TRUE}

@@ -1,0 +1,237 @@
+---
+title: "SDH inhibition snMultiome RNA & ATAC-seq"
+author: "Dakota Nuttall"
+date: "2025-06-17"
+R-version: 4.3.3
+---
+###Cardiac Fibroblast Analysis###
+
+```{r echo=TRUE}
+set.seed(1234)
+library(Seurat)
+library(Signac)
+library(chromVAR)
+library(dplyr)
+library(reticulate)
+library(hdf5r)
+library(scales)
+library(ggplot2)
+library(openxlsx)
+library(readxl)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(org.Mm.eg.db)
+library(JASPAR2020)
+library(TFBSTools)
+library(harmony)
+library(pheatmap)
+library(EnhancedVolcano)
+library(ggrepel)
+library(tidyr)
+library(gridExtra)
+library(ggpubr)
+```
+####  Load data  ####
+
+```{r echo=TRUE}
+#Load integrated file
+aggregated_samples <- readRDS("aggregated_wnn.rds")
+
+#Subset Cardiac Fibroblast (CF) population
+aggregated_Cardiac_Fibroblasts <- subset(aggregated_samples, idents = "Cardiac_Fibroblasts")
+aggregated_Cardiac_Fibroblasts <- SCTransform(aggregated_Cardiac_Fibroblasts, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+
+DefaultAssay(aggregated_Cardiac_Fibroblasts) <- "SCT"
+
+```
+##Establish new RNA, ATAC and WNN umaps
+
+```{r echo=TRUE}
+
+ElbowPlot(aggregated_Cardiac_Fibroblasts, reduction = "pca", ndims = 50)
+aggregated_Cardiac_Fibroblasts <- RunUMAP(aggregated_Cardiac_Fibroblasts, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+aggregated_Cardiac_Fibroblasts <- PrepSCTFindMarkers(aggregated_Cardiac_Fibroblasts, assay = "SCT",verbose = T)
+
+DefaultAssay(aggregated_Cardiac_Fibroblasts) <- "peakunion"
+
+aggregated_Cardiac_Fibroblasts <- FindTopFeatures(aggregated_Cardiac_Fibroblasts, min.cutoff = 10)
+aggregated_Cardiac_Fibroblasts<- RunTFIDF(aggregated_Cardiac_Fibroblasts,)
+aggregated_Cardiac_Fibroblasts <- RunSVD(aggregated_Cardiac_Fibroblasts)
+
+ElbowPlot(aggregated_Cardiac_Fibroblasts, ndims = 50, reduction = "harmony_lsi")
+
+aggregated_Cardiac_Fibroblasts <- RunUMAP(object = aggregated_Cardiac_Fibroblasts, reduction = 'harmony_lsi', dims = 2:50, reduction.name = "umap_peakunion", reduction.key = "peakunionUMAP_")
+
+
+DefaultAssay(aggregated_Cardiac_Fibroblasts) <- "SCT"
+FindDimNumber(aggregated_Cardiac_Fibroblasts,reduction = "lsi")
+aggregated_Cardiac_Fibroblasts <- FindMultiModalNeighbors(
+  object = aggregated_Cardiac_Fibroblasts,
+  reduction.list = list("harmony_pca", "lsi"), 
+    dims.list = list(1:30, 2:30), #Selected to be ideal number of dims after visual assessment
+  modality.weight.name = c("SCT.weight","peakunion.weight"),
+  verbose = TRUE
+)
+aggregated_Cardiac_Fibroblasts <- RunUMAP(
+  object = aggregated_Cardiac_Fibroblasts,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNN_UMAP_",
+  verbose = TRUE,
+)
+
+aggregated_Cardiac_Fibroblasts<- FindClusters(aggregated_Cardiac_Fibroblasts, graph.name = "wsnn", algorithm = 3, resolution = seq(.1,.5,.1))
+
+quick_CT_plot(aggregated_Cardiac_Fibroblasts, 2,"WNN_umap",legend = F,label = T, font.size = 8, resolution = "SCT_snn_res.0.1")
+quick_cond_plot(aggregated_Cardiac_Fibroblasts, 2,"WNN_umap",legend = F)
+
+```
+##
+Find differentially expressed genes (DEGs) and identitify ambiguous clusters
+```{r echo=TRUE}
+#Identify upregulated genes
+aggregated.Cardiac_Fibroblastsmarkers <- FindAllMarkers(aggregated_Cardiac_Fibroblasts, only.pos = F, min.pct = 0.1, logfc.threshold = .3, test.use = "MAST", recorrect_umi = TRUE, assay = "SCT")
+aggregated.Cardiac_Fibroblastsmarkers <- subset(aggregated.Cardiac_Fibroblastsmarkers, p_val_adj < 0.05)
+
+#Identify abnormal RNA counts
+VlnPlot(aggregated_Cardiac_Fibroblasts, "nCount_RNA",pt.size = .1, cols = clust_colors) + NoLegend()+ xlab(NULL) + theme(text=element_text(size=14),axis.text=element_text(size=18,face="bold"),axis.title=element_text(size=20,face="bold"))
+
+##There were no ablnormal clusters in this dataset so we procede normally
+
+Cardiac_Fibroblasts_cell_types <- c("CF1","CF3","CF2") 
+aggregated_Cardiac_Fibroblasts@active.ident<-factor(aggregated_Cardiac_Fibroblasts@active.ident, labels = Cardiac_Fibroblasts_cell_types)
+
+Cardiac_Fibroblasts_cell_levels <- c("CF1","CF2","CF3")
+aggregated_Cardiac_Fibroblasts@active.ident<-factor(aggregated_Cardiac_Fibroblasts@active.ident, levels =  Cardiac_Fibroblasts_cell_levels)
+
+clust_colors <- c("darkorange2","mediumorchid2","steelblue3","olivedrab","indianred1","hotpink","darkred","green3","grey")
+treatment_colors <-c("lightskyblue","pink", "steelblue4","red3")                                         
+quick_CT_plot(aggregated_Cardiac_Fibroblasts, 2,"WNN_umap",legend = F,label = T, font.size = 8)
+ggsave("Cardiac_Fibroblasts_umap_sub.tiff", height = 5,width = 5)
+quick_cond_plot(aggregated_Cardiac_Fibroblasts, 2,"WNN_umap",legend = F)
+ggsave("Cardiac_Fibroblasts_umap_cond.tiff", height = 5,width = 5)
+
+
+```
+## Find DEGs once again for Volcano plots and Gene Ontology (see GO script)
+
+```{r echo=TRUE}
+aggregated.Cardiac_Fibroblastsmarkers <- FindAllMarkers(aggregated_Cardiac_Fibroblasts, only.pos = F, min.pct = 0.1, logfc.threshold = .3, test.use = "MAST", recorrect_umi = TRUE, assay = "SCT")
+aggregated.Cardiac_Fibroblastsmarkers <- subset(aggregated.Cardiac_Fibroblastsmarkers, p_val_adj < 0.05)
+write.xlsx(aggregated.Cardiac_Fibroblastsmarkers,"aggregated_Cardiac_Fibroblasts_DEGs.xlsx")
+```
+## Volcano plot analysis
+
+```{r echo=TRUE}
+
+##For CF2
+DefaultAssay(aggregated_Cardiac_Fibroblasts) <- "SCT"
+CF2_marker <- FindMarkers(aggregated_Cardiac_Fibroblasts, ident.1 = "CF2", only.pos = F, min.pct = 0.1, logfc.threshold = .3, test.use = "MAST", recorrect_umi = TRUE, assay = "SCT" )
+CF2_marker$gene <- rownames(CF2_marker)
+CF2_marker <- CF2_marker[!grepl("mt-",CF2_marker$gene),]
+CF2_marker_sig <- subset(CF2_marker, p_val_adj < 0.05)
+
+lab_italics <- paste0("italic('", rownames(CF2_marker), "')")
+select_labels <-c(head(row.names(CF2_marker),n=10), 'Gpr176','Col3a1',head(row.names(subset(CF2_marker, avg_log2FC < 0)),n=10))
+select_labels <- paste0("italic('",c(head(row.names(CF2_marker),n=20), 'Gpr176','Col3a1',head(row.names(subset(CF2_marker, avg_log2FC < 0)),n=10)), "')")
+
+
+#find number of significant upregulated and downregulated genes
+sum(CF2_marker_sig$avg_log2FC < 0)
+sum(CF2_marker_sig$avg_log2FC > 0)
+
+up_down_volcano(CF2_marker, selectLab =  select_labels,italicLab = lab_italics,up_label = "CF2 Upregulated Genes (506 significant)",down_label = "CF2 Downregulated Genes (765 significant)",volcano_name = "CF2_volcano.tiff", up_x = 6,down_x = -5 )
+
+##For CF3
+DefaultAssay(aggregated_Cardiac_Fibroblasts) <- "SCT"
+CF3_marker <- FindMarkers(aggregated_Cardiac_Fibroblasts, ident.1 = "CF3", only.pos = F, min.pct = 0.1, logfc.threshold = .3, test.use = "MAST", recorrect_umi = TRUE, assay = "SCT" )
+CF3_marker$gene <- rownames(CF3_marker)
+CF3_marker <- CF3_marker[!grepl("mt-",CF3_marker$gene),]
+CF3_marker_sig <- subset(CF3_marker, p_val_adj < 0.05)
+
+lab_italics <- paste0("italic('", rownames(CF3_marker), "')")
+select_labels <-c(head(row.names(CF3_marker),n=10), 'Vcan',head(row.names(subset(CF3_marker, avg_log2FC < 0)),n=10))
+select_labels <- paste0("italic('",c(head(row.names(CF3_marker),n=15), 'Vcan',head(row.names(subset(CF3_marker, avg_log2FC < 0)),n=10)), "')")
+
+#find number of significant upregulated and downregulated genes
+sum(CF3_marker_sig$avg_log2FC < 0)
+sum(CF3_marker_sig$avg_log2FC > 0)
+
+up_down_volcano(CF3_marker, selectLab =  select_labels,italicLab = lab_italics,up_label = "CF3 Upregulated Genes (1115 significant)",down_label = "CF3 Downregulated Genes (566 significant)",volcano_name = "CF3_volcano.tiff", up_x = 6,down_x = -4.5 )
+```
+## Identify upregulated ATAC peaks
+
+```{r echo=TRUE}
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+annotation <- renameSeqlevels(annotation, mapSeqlevels(seqlevels(annotation), "UCSC"))
+DefaultAssay(aggregated_Cardiac_Fibroblasts) <- 'peakunion'
+Annotation(aggregated_Cardiac_Fibroblasts) <- annotation
+
+
+# Linear regression is commonly used to analyze ATAC Peaks
+da_unionpeak <- FindMarkers(aggregated_Cardiac_Fibroblasts,
+  ident.1 = "CF2",
+  test.use = 'LR',
+  min.pct = 0.1, only.pos = F,
+  logfc.threshold = 0.3, 
+  latent.vars = 'nCount_peakunion',
+)
+da_unionpeak <- da_unionpeak[da_unionpeak$p_val_adj < 0.05 , ]
+da_unionpeak$region <- rownames(da_unionpeak)
+closest_genes <- ClosestFeature(aggregated_Cardiac_Fibroblasts, regions = rownames(da_unionpeak))
+da_unionpeak <- do.call(cbind, list(da_unionpeak,closest_genes)) 
+head(da_unionpeak)
+write.xlsx(da_unionpeak,"CF2_unionpeak.xlsx")
+
+open_CF2 <- da_unionpeak$region[da_unionpeak$avg_log2FC > 0.3 ]
+open_CF3 <- da_unionpeak$region[da_unionpeak$avg_log2FC > 0.3 ]
+
+#This function identifies genes that are closest to the peak
+closest_genes_CF2 <- ClosestFeature(aggregated_Cardiac_Fibroblasts, regions = open_CF2)
+closest_genes_CF3 <- ClosestFeature(aggregated_Cardiac_Fibroblasts, regions = open_CF3)
+
+up_genes_CF2 <- CF2_marker_sub$gene[CF2_marker_sub$avg_log2FC > 0.3 ]
+up_genes_CF3 <- CF3_marker_sub$gene[CF3_marker_sub$avg_log2FC > 0.3 ]
+
+#Identify genes that were significantly upregulated that also have a nearby significantly accessible peak
+up_RNA_ATAC_CF2 <- intersect(up_genes_CF2,closest_genes_CF2$gene_name)
+up_RNA_ATAC_CF2
+
+up_RNA_ATAC_CF3 <- intersect(up_genes_CF3,closest_genes_CF3$gene_name)
+up_RNA_ATAC_CF3
+
+
+#visualize differentially accessible peaks that have nearby significantly upregulated gene
+
+regions_highlight <- subsetByOverlaps(StringToGRanges(open_CF3), # Make sure to change to 'open_CF2' when analyzing CF2 peaks
+LookupGeneCoords(aggregated_Cardiac_Fibroblasts, "Egr1"),maxgap = 1000)
+# Can use this for manual selection: regions_highlight <- StringToGRanges("region")
+regions_highlight$color <- "skyblue4"
+
+p<-CoveragePlot(
+  aggregated_Cardiac_Fibroblasts,
+  region = "Egr1",
+  region.highlight = regions_highlight,
+  extend.upstream = 2000,
+  extend.downstream = 2000,  
+)
+
+p & scale_fill_manual(values =  clust_colors) & theme( strip.text =element_text(size=16, face = "bold"),axis.title=element_text(size=14,face="bold"),legend.text  = element_text(face="bold", size = 12))
+ggsave("CF_Egr1_peak.tiff",height = 5,width = 6)
+
+## repeat for Mt1 and Mt2 in CF3 and Gpr176, Fn1 and Runx1 for CF2
+```
+## Proportion plots and subcluster heatmaps
+```{r echo=TRUE}
+
+aggregated_Cardiac_Fibroblasts$Cell_state <- Idents(aggregated_Cardiac_Fibroblasts)
+#These functions can be found in the helper functions script
+proportion_plots(aggregated_Cardiac_Fibroblasts, cond_color = treatment_colors, clust_color = clust_colors, name.clust = "CF_prop_sub.tiff", name.cond = "CF_prop_cond.tiff",height = 4, width = 4)
+
+prop_heatmap(aggregated_Cardiac_Fibroblasts, "CF_heat_prop.tiff")
+
+#Save dataset
+save(aggregated_Cardiac_Fibroblasts,"Cardiac_Fibroblasts.rds")
+```
