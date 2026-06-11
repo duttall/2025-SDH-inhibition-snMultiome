@@ -1,0 +1,318 @@
+---
+title: "SDH inhibition snMultiome RNA & ATAC-seq"
+author: "Dakota Nuttall"
+date: "2025-06-17"
+R-version: 4.3.3
+
+---
+
+###KEGG Analysis###
+```{r echo=TRUE}
+set.seed(1234)
+library(Seurat)
+library(dplyr)
+library(clusterProfiler)
+library(readxl)
+library(ggplot2)
+library(openxlsx)
+library(stringr)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(org.Mm.eg.db)
+library(JASPAR2024)
+library(enrichplot)
+library(stringr)
+```
+####  Load data  ####
+
+```{r echo=TRUE}
+###KEGG Analaysis (repeat for each dataset)
+KEGGcluster<- read.xlsx("CF_all_DEGs_sig.xlsx")# repeat for each comparison
+sig_genes <- KEGGcluster[KEGGcluster$cluster == "CF1",]# KEGGcluster$comparison for condition comparisons and KEGGcluster$cluster for cluster comparisons
+sig_genes  <- subset(sig_genes ,  avg_log2FC > 0.25) #for upregulated or Saline MI or upregulated cluster
+#sig_genes  <- subset(sig_genes ,  avg_log2FC < -0.25) # for downregulated or Malonate MI
+
+# Remove duplicates genes, keeping the first occurrence (very rare occurrence due to one gene having multiple EnsembleID)
+sig_genes <- sig_genes %>%
+  distinct(gene, .keep_all = TRUE)
+
+
+```
+#Perform KEGG analysis
+```{r echo=TRUE}
+gene_ids <- bitr(sig_genes$gene, 
+                 fromType = "SYMBOL", 
+                 toType = "ENTREZID", 
+                 OrgDb = org.Mm.eg.db,drop = F)
+
+kegg_res <- enrichKEGG(gene         = gene_ids$ENTREZID,
+                       organism     = 'mmu', 
+                       pAdjustMethod = "BH",
+                       pvalueCutoff  = 0.05,
+                       qvalueCutoff  = 0.2)
+# Extract results as a dataframe
+kegg_df <- as.data.frame(x = kegg_res@result)
+kegg_df <- subset(kegg_df, p.adjust <= .05)
+
+# Split the geneID column into individual Entrez IDs
+entrez_list <- unique(unlist(strsplit(kegg_df$geneID, "/")))
+
+# Map Entrez IDs to gene symbols
+id_map <- bitr(entrez_list,
+               fromType = "ENTREZID",
+               toType = "SYMBOL",
+               OrgDb = org.Mm.eg.db,)
+
+head(id_map)
+
+# Make a lookup table
+id_to_symbol <- setNames(id_map$SYMBOL, id_map$ENTREZID)
+
+# Replace Entrez IDs with symbols in each row
+kegg_df$gene_symbols <- sapply(strsplit(kegg_df$geneID, "/"), function(x) {
+  paste(id_to_symbol[x], collapse = "/")
+})
+kegg_df$log10p.adjusted <- -log10(kegg_df$p.adjust)
+kegg_df$labels <- paste(kegg_df$Description,kegg_df$ID)
+kegg_df <- kegg_df %>% mutate(labels = str_remove(labels, fixed(" Mus musculus (house mouse)")))
+
+# Create a new column for the wrapped labels
+kegg_df$labels_wrapped <- NA
+
+# Apply the custom function to each row using a for loop
+for (i in 1:nrow(kegg_df)) {
+  kegg_df$labels_wrapped[i] <- split_into_two_lines(kegg_df$labels[i])
+}
+
+
+write.xlsx(kegg_df, "CF1_KEGG_results.xlsx") #repeat for downregulated and other subculsters
+
+```
+##Identify key and unique KEGG Terms )
+```{r echo=TRUE}
+#Load each KEGG dataset and identify terms that are unique to each cluster/treatment (Note: Both unique and shared terms were used for final analysis, degree of upregulation and which genes contributed to the terms was also taken into account)
+
+##Find unique terms
+kegg_df_CM1 <- read.xlsx("CM1_KEGG_results.xlsx")
+kegg_df_CM1$cluster <- "CM1"
+kegg_df_CM2 <- read.xlsx("CM2_KEGG_results.xlsx")
+kegg_df_CM2$cluster <- "CM2"
+kegg_df_CM3 <- read.xlsx("CM3_KEGG_results.xlsx")
+kegg_df_CM3$cluster <- "CM3"
+
+kegg_df_CM1_filtered <- dplyr::filter(kegg_df_CM1, !Description %in% kegg_df_CM2$Description & !Description %in% kegg_df_CM3$Description)
+kegg_df_CM2_filtered <- dplyr::filter(kegg_df_CM2, !Description %in% kegg_df_CM1$Description & !Description %in% kegg_df_CM3$Description)
+kegg_df_CM3_filtered <- dplyr::filter(kegg_df_CM3, !Description %in% kegg_df_CM1$Description & !Description %in% kegg_df_CM2$Description)
+
+kegg_df_CF1 <- read.xlsx("CF1_KEGG_results.xlsx")
+kegg_df_CF1$cluster <- "CF1"
+kegg_df_CF2 <- read.xlsx("CF2_KEGG_results.xlsx")
+kegg_df_CF2$cluster <- "CF2"
+kegg_df_CF3 <- read.xlsx("CF3_KEGG_results.xlsx")
+kegg_df_CF3$cluster <- "CF3"
+
+kegg_df_CF1_filtered <- dplyr::filter(kegg_df_CF1, !Description %in% kegg_df_CF2$Description & !Description %in% kegg_df_CF3$Description)
+kegg_df_CF2_filtered <- dplyr::filter(kegg_df_CF2, !Description %in% kegg_df_CF1$Description & !Description %in% kegg_df_CF3$Description)
+kegg_df_CF3_filtered <- dplyr::filter(kegg_df_CF3, !Description %in% kegg_df_CF1$Description & !Description %in% kegg_df_CF2$Description)
+
+kegg_df_CM_MalSham <- read.xlsx("CM_MalSham_KEGG_results.xlsx")
+kegg_df_CM_MalSham$condition <- "Malonate Sham"
+kegg_df_CM_SalSham<- read.xlsx("CM_SalSham_KEGG_results.xlsx")
+kegg_df_CM_SalSham$condition <- "Saline Sham"
+
+kegg_df_CM_MalSham_filtered <- dplyr::filter(kegg_df_CM_MalSham, !Description %in% kegg_df_CM_SalSham$Description)
+kegg_df_CM_SalSham_filtered <- dplyr::filter(kegg_df_CM_SalSham, !Description %in% kegg_df_CM_MalSham$Description)
+
+kegg_df_CM_MalMI <- read.xlsx("CM_MalMI_KEGG_results.xlsx")
+kegg_df_CM_MalMI$condition <- "Malonate MI"
+kegg_df_CM_SalMI<- read.xlsx("CM_SalMI_KEGG_results.xlsx")
+kegg_df_CM_SalMI$condition <- "Saline MI"
+
+kegg_df_CM_MalMI_filtered <- dplyr::filter(kegg_df_CM_MalMI, !Description %in% kegg_df_CM_SalMI$Description)
+kegg_df_CM_SalMI_filtered <- dplyr::filter(kegg_df_CM_SalMI, !Description %in% kegg_df_CM_MalMI$Description)
+
+kegg_df_CF_MalSham <- read.xlsx("CF_MalSham_KEGG_results.xlsx")
+kegg_df_CF_MalSham$condition <- "Malonate Sham"
+kegg_df_CF_SalSham <- read.xlsx("CF_SalSham_KEGG_results.xlsx")
+kegg_df_CF_SalSham$condition <- "Saline Sham"
+
+kegg_df_CF_MalSham_filtered <- dplyr::filter(kegg_df_CF_MalSham, !Description %in% kegg_df_CF_SalSham$Description)
+kegg_df_CF_SalSham_filtered <- dplyr::filter(kegg_df_CF_SalSham, !Description %in% kegg_df_CF_MalSham$Description)
+
+kegg_df_CF_MalMI <- read.xlsx("CF_MalMI_KEGG_results.xlsx")
+kegg_df_CF_MalMI$condition <- "Malonate MI"
+kegg_df_CF_SalMI<- read.xlsx("CF_SalMI_KEGG_results.xlsx")
+kegg_df_CF_SalMI$condition <- "Saline MI"
+
+kegg_df_CF_MalMI_filtered <- dplyr::filter(kegg_df_CF_MalMI, !Description %in% kegg_df_CF_SalMI$Description)
+kegg_df_CF_SalMI_filtered <- dplyr::filter(kegg_df_CF_SalMI, !Description %in% kegg_df_CF_MalMI$Description)
+
+kegg_df_EC_MalSham <- read.xlsx("EC_MalSham_KEGG_results.xlsx")
+kegg_df_EC_MalSham$condition <- "Malonate Sham"
+kegg_df_EC_SalSham <- read.xlsx("EC_SalSham_KEGG_results.xlsx")
+kegg_df_EC_SalSham$condition <- "Saline Sham"
+
+kegg_df_EC_MalSham_filtered <- dplyr::filter(kegg_df_EC_MalSham, !Description %in% kegg_df_EC_SalSham$Description)
+kegg_df_EC_SalSham_filtered <- dplyr::filter(kegg_df_EC_SalSham, !Description %in% kegg_df_EC_MalSham$Description)
+
+kegg_df_EC_MalMI <- read.xlsx("EC_MalMI_KEGG_results.xlsx")
+kegg_df_EC_MalMI$condition <- "Malonate MI"
+kegg_df_EC_SalMI<- read.xlsx("EC_SalMI_KEGG_results.xlsx")
+kegg_df_EC_SalMI$condition <- "Saline MI"
+
+kegg_df_EC_MalMI_filtered <- dplyr::filter(kegg_df_EC_MalMI, !Description %in% kegg_df_EC_SalMI$Description)
+kegg_df_EC_SalMI_filtered <- dplyr::filter(kegg_df_EC_SalMI, !Description %in% kegg_df_EC_MalMI$Description)
+
+kegg_df_Mural_MalSham <- read.xlsx("Mural_MalSham_KEGG_results.xlsx")
+kegg_df_Mural_MalSham$condition <- "Malonate Sham"
+kegg_df_Mural_SalSham <- read.xlsx("Mural_SalSham_KEGG_results.xlsx")
+kegg_df_Mural_SalSham$condition <- "Saline Sham"
+
+kegg_df_Mural_MalSham_filtered <- dplyr::filter(kegg_df_Mural_MalSham, !Description %in% kegg_df_Mural_SalSham$Description)
+kegg_df_Mural_SalSham_filtered <- dplyr::filter(kegg_df_Mural_SalSham, !Description %in% kegg_df_Mural_MalSham$Description)
+
+kegg_df_Mural_MalMI <- read.xlsx("Mural_MalMI_KEGG_results.xlsx")
+kegg_df_Mural_MalMI$condition <- "Malonate MI"
+kegg_df_Mural_SalMI<- read.xlsx("Mural_SalMI_KEGG_results.xlsx")
+kegg_df_Mural_SalMI$condition <- "Saline MI"
+
+kegg_df_Mural_MalMI_filtered <- dplyr::filter(kegg_df_Mural_MalMI, !Description %in% kegg_df_Mural_SalMI$Description)
+kegg_df_Mural_SalMI_filtered <- dplyr::filter(kegg_df_Mural_SalMI, !Description %in% kegg_df_Mural_MalMI$Description)
+
+kegg_df_Mye_MalSham <- read.xlsx("Mye_MalSham_KEGG_results.xlsx")
+#kegg_df_Mye_MalSham$condition <- "Malonate Sham" ### No significant KEGG terms
+kegg_df_Mye_SalSham <- read.xlsx("Mye_SalSham_KEGG_results.xlsx")
+kegg_df_Mye_SalSham$condition <- "Saline Sham"
+
+kegg_df_Mye_MalMI <- read.xlsx("Mye_MalMI_KEGG_results.xlsx")
+kegg_df_Mye_MalMI$condition <- "Malonate MI"
+kegg_df_Mye_SalMI<- read.xlsx("Mye_SalMI_KEGG_results.xlsx")
+kegg_df_Mye_SalMI$condition <- "Saline MI"
+
+kegg_df_Mye_MalMI_filtered <- dplyr::filter(kegg_df_Mye_MalMI, !Description %in% kegg_df_Mye_SalMI$Description)
+kegg_df_Mye_SalMI_filtered <- dplyr::filter(kegg_df_Mye_SalMI, !Description %in% kegg_df_Mye_MalMI$Description)
+
+##Merge DFs and remove unnecessary columns
+cols_keep <- c("category","subcategory","ID","Description","GeneRatio","BgRatio","pvalue","p.adjust","qvalue","gene_symbols","cluster")
+
+#For cell-level Subcluster analysis
+Subcluster_CM_KEGG <- rbind(kegg_df_CM1,kegg_df_CM2)
+Subcluster_CM_KEGG <- rbind(Subcluster_CM_KEGG,kegg_df_CM3)
+Subcluster_CM_KEGG <- Subcluster_CM_KEGG[,cols_keep]
+Subcluster_CM_KEGG <- rename(Subcluster_CM_KEGG, gene_symbols = "geneID")
+
+Subcluster_CF_KEGG <- rbind(kegg_df_CF1,kegg_df_CF2)
+Subcluster_CF_KEGG <- rbind(Subcluster_CF_KEGG,kegg_df_CF3)
+Subcluster_CF_KEGG <- Subcluster_CF_KEGG[,cols_keep]
+Subcluster_CF_KEGG <- rename(Subcluster_CF_KEGG, gene_symbols = "geneID")
+
+#For condition level analysis
+cols_keep <- c("category","subcategory","ID","Description","GeneRatio","BgRatio","pvalue","p.adjust","qvalue","gene_symbols","condition")
+
+Cond_CM_SalvMal_KEGG <- rbind(kegg_df_CM_SalSham,kegg_df_CM_MalSham)
+Cond_CM_SalvMal_KEGG <- rbind(Cond_CM_SalvMal_KEGG,kegg_df_CM_SalMI)
+Cond_CM_SalvMal_KEGG <- rbind(Cond_CM_SalvMal_KEGG,kegg_df_CM_MalMI)
+Cond_CM_SalvMal_KEGG <- Cond_CM_SalvMal_KEGG[,cols_keep]
+Cond_CM_SalvMal_KEGG <- rename(Cond_CM_SalvMal_KEGG, gene_symbols = "geneID")
+
+Cond_CF_SalvMal_KEGG <- rbind(kegg_df_CF_SalSham,kegg_df_CF_MalSham)
+Cond_CF_SalvMal_KEGG <- rbind(Cond_CF_SalvMal_KEGG,kegg_df_CF_SalMI)
+Cond_CF_SalvMal_KEGG <- rbind(Cond_CF_SalvMal_KEGG,kegg_df_CF_MalMI)
+Cond_CF_SalvMal_KEGG <- Cond_CF_SalvMal_KEGG[,cols_keep]
+Cond_CF_SalvMal_KEGG <- rename(Cond_CF_SalvMal_KEGG, gene_symbols = "geneID")
+
+Cond_EC_SalvMal_KEGG <- rbind(kegg_df_EC_SalSham,kegg_df_EC_MalSham)
+Cond_EC_SalvMal_KEGG <- rbind(Cond_EC_SalvMal_KEGG,kegg_df_EC_SalMI)
+Cond_EC_SalvMal_KEGG <- rbind(Cond_EC_SalvMal_KEGG,kegg_df_EC_MalMI)
+Cond_EC_SalvMal_KEGG <- Cond_EC_SalvMal_KEGG[,cols_keep]
+Cond_EC_SalvMal_KEGG <- rename(Cond_EC_SalvMal_KEGG, gene_symbols = "geneID")
+
+Cond_Mural_SalvMal_KEGG <- rbind(kegg_df_Mural_SalSham,kegg_df_Mural_MalSham)
+Cond_Mural_SalvMal_KEGG <- rbind(Cond_Mural_SalvMal_KEGG,kegg_df_Mural_SalMI)
+Cond_Mural_SalvMal_KEGG <- rbind(Cond_Mural_SalvMal_KEGG,kegg_df_Mural_MalMI)
+Cond_Mural_SalvMal_KEGG <- Cond_Mural_SalvMal_KEGG[,cols_keep]
+Cond_Mural_SalvMal_KEGG <- rename(Cond_Mural_SalvMal_KEGG, gene_symbols = "geneID")
+
+Cond_Mye_SalvMal_KEGG <- rbind(kegg_df_Mye_SalSham,kegg_df_Mye_MalSham)
+Cond_Mye_SalvMal_KEGG <- rbind(Cond_Mye_SalvMal_KEGG,kegg_df_Mye_SalMI)
+Cond_Mye_SalvMal_KEGG <- rbind(Cond_Mye_SalvMal_KEGG,kegg_df_Mye_MalMI)
+Cond_Mye_SalvMal_KEGG <- Cond_Mye_SalvMal_KEGG[,cols_keep]
+Cond_Mye_SalvMal_KEGG <- rename(Cond_Mye_SalvMal_KEGG, gene_symbols = "geneID")
+
+# Load the library
+library(writexl)
+
+# Create a named list of data frames 
+KEGG_df_list <- list("Subcluster CM upregulated" = Subcluster_CM_KEGG, "Subcluster CF upregulated" = Subcluster_CF_KEGG, "Condition CM Sal vs Mal" = Cond_CM_SalvMal_KEGG, "Condition CF Sal vs Mal" = Cond_CF_SalvMal_KEGG, "Condition EC Sal vs Mal" = Cond_EC_SalvMal_KEGG, "Condition Mural Sal vs Mal" = Cond_Mural_SalvMal_KEGG, "Condition Myeloid Sal vs Mal" = Cond_Mye_SalvMal_KEGG)
+
+# Write the entire list to an Excel file
+write_xlsx(KEGG_df_list, "Supplemental table 4 (KEGG).xlsx")
+
+```
+##Select KEGG Terms
+```{r echo=TRUE}
+###Pathways of interest
+CF1_KEGG <- c("Circadian rhythm - Mus musculus (house mouse)","N-Glycan biosynthesis - Mus musculus (house mouse)","JAK-STAT signaling pathway - Mus musculus (house mouse)","Lysine degradation - Mus musculus (house mouse)")
+
+CF2_KEGG <- c("Hypertrophic cardiomyopathy - Mus musculus (house mouse)","ECM-receptor interaction - Mus musculus (house mouse)","Cardiac muscle contraction - Mus musculus (house mouse)","GnRH signaling pathway - Mus musculus (house mouse)")
+
+CF3_KEGG <- c("Nucleocytoplasmic transport - Mus musculus (house mouse)","HIF-1 signaling pathway - Mus musculus (house mouse)","PI3K-Akt signaling pathway - Mus musculus (house mouse)","ErbB signaling pathway - Mus musculus (house mouse)")
+
+CM1_KEGG <- c("Cardiac muscle contraction - Mus musculus (house mouse)","Oxidative phosphorylation - Mus musculus (house mouse)","Carbon metabolism - Mus musculus (house mouse)","Fatty acid metabolism - Mus musculus (house mouse)")
+
+CM2_KEGG <- c("Integrin signaling - Mus musculus (house mouse)","Rap1 signaling pathway - Mus musculus (house mouse)","MAPK signaling pathway - Mus musculus (house mouse)","ECM-receptor interaction - Mus musculus (house mouse)")
+
+CM3_KEGG <- c("PI3K-Akt signaling pathway - Mus musculus (house mouse)","AMPK signaling pathway - Mus musculus (house mouse)","Autophagy - animal - Mus musculus (house mouse)","Notch signaling pathway - Mus musculus (house mouse)")
+
+CM_SalSham_KEGG <- c("Oxidative phosphorylation - Mus musculus (house mouse)","Citrate cycle (TCA cycle) - Mus musculus (house mouse)","Cardiac muscle contraction - Mus musculus (house mouse)","Pyruvate metabolism - Mus musculus (house mouse)")
+
+CM_MalSham_KEGG <-c("cGMP-PKG signaling pathway - Mus musculus (house mouse)","Calcium signaling pathway - Mus musculus (house mouse)","Apelin signaling pathway - Mus musculus (house mouse)","Oxytocin signaling pathway - Mus musculus (house mouse)")
+
+CM_SalMI_KEGG <- c("ECM-receptor interaction - Mus musculus (house mouse)","Hypertrophic cardiomyopathy - Mus musculus (house mouse)","TGF-beta signaling pathway - Mus musculus (house mouse)","Dilated cardiomyopathy - Mus musculus (house mouse)")
+
+CM_MalMI_KEGG <-c("Autophagy - animal - Mus musculus (house mouse)","Hippo signaling pathway - Mus musculus (house mouse)","AMPK signaling pathway - Mus musculus (house mouse)","Cardiac muscle contraction - Mus musculus (house mouse)")
+
+CF_MalSham_KEGG <- c("Circadian rhythm - Mus musculus (house mouse)")
+
+CF_SalSham_KEGG <- c("Oxidative phosphorylation - Mus musculus (house mouse)","Citrate cycle (TCA cycle) - Mus musculus (house mouse)","Cardiac muscle contraction - Mus musculus (house mouse)","Pyruvate metabolism - Mus musculus (house mouse)")
+
+CF_SalMI_KEGG <- c("Hypertrophic cardiomyopathy - Mus musculus (house mouse)","ECM-receptor interaction - Mus musculus (house mouse)","Cardiac muscle contraction - Mus musculus (house mouse)","Calcium signaling pathway - Mus musculus (house mouse)")
+
+CF_MalMI_KEGG <-c("Hippo signaling pathway - Mus musculus (house mouse)","AMPK signaling pathway - Mus musculus (house mouse)","Autophagy - animal - Mus musculus (house mouse)","Notch signaling pathway - Mus musculus (house mouse)")
+
+EC_MalSham_KEGG <- c("Antigen processing and presentation - Mus musculus (house mouse)")
+
+EC_SalSham_KEGG <- c("Oxidative phosphorylation - Mus musculus (house mouse)","Citrate cycle (TCA cycle) - Mus musculus (house mouse)","Cardiac muscle contraction - Mus musculus (house mouse)","Pyruvate metabolism - Mus musculus (house mouse)")
+
+EC_SalMI_KEGG <- c("ECM-receptor interaction - Mus musculus (house mouse)","Hypertrophic cardiomyopathy - Mus musculus (house mouse)","Dilated cardiomyopathy - Mus musculus (house mouse)","Cell adhesion molecule (CAM) interaction - Mus musculus (house mouse)")
+
+EC_MalMI_KEGG <-c("ErbB signaling pathway - Mus musculus (house mouse)","MAPK signaling pathway - Mus musculus (house mouse)","Autophagy - animal - Mus musculus (house mouse)","AMPK signaling pathway - Mus musculus (house mouse)")
+
+Mural_MalSham_KEGG <- c("Notch signaling pathway - Mus musculus (house mouse)")
+
+Mural_SalSham_KEGG <- c("Oxidative phosphorylation - Mus musculus (house mouse)","Citrate cycle (TCA cycle) - Mus musculus (house mouse)","Cardiac muscle contraction - Mus musculus (house mouse)","Pyruvate metabolism - Mus musculus (house mouse)")
+
+Mural_SalMI_KEGG <- c("ECM-receptor interaction - Mus musculus (house mouse)","Hypertrophic cardiomyopathy - Mus musculus (house mouse)","TGF-beta signaling pathway - Mus musculus (house mouse)","Rap1 signaling pathway - Mus musculus (house mouse)")
+
+Mural_MalMI_KEGG <-c("Autophagy - animal - Mus musculus (house mouse)","ErbB signaling pathway - Mus musculus (house mouse)","AMPK signaling pathway - Mus musculus (house mouse)","Cell cycle - Mus musculus (house mouse)")
+
+Mye_SalSham_KEGG <- c("Oxidative phosphorylation - Mus musculus (house mouse)","Citrate cycle (TCA cycle) - Mus musculus (house mouse)","Cardiac muscle contraction - Mus musculus (house mouse)","Pyruvate metabolism - Mus musculus (house mouse)")
+
+Mye_SalMI_KEGG <- c("Apoptosis - Mus musculus (house mouse)","Calcium signaling pathway - Mus musculus (house mouse)","PPAR signaling pathway - Mus musculus (house mouse)","GnRH secretion - Mus musculus (house mouse)")
+
+Mye_MalMI_KEGG <-c("AMPK signaling pathway - Mus musculus (house mouse)","Wnt signaling pathway - Mus musculus (house mouse)","ErbB signaling pathway - Mus musculus (house mouse)","VEGF signaling pathway - Mus musculus (house mouse)")
+
+
+```
+## Plot enriched pathways
+```{r echo=TRUE}
+ggplot(kegg_df_EC_MalMI[kegg_df_EC_MalMI$Description %in% EC_MalMI_KEGG,], aes(x=log10p.adjusted, y= reorder(labels_wrapped,log10p.adjusted), fill = qvalue)) +
+  geom_col() +
+  labs(title = "", x = "-10log[p.adjusted]", y = "") + scale_fill_gradient(low="red", high="blue") +
+  theme(text = element_text(size=26))
+
+ggsave("EC_MalMI_KEGG_bar.tif",height = 4,width = 8)
+
+##Repeat for each cluster/condition
+
+```

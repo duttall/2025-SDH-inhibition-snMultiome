@@ -1,0 +1,776 @@
+---
+title: "SDH inhibition snMultiome RNA & ATAC-seq"
+author: "Dakota Nuttall"
+date: "2025-06-17"
+R-version: 4.3.3
+---
+###Myeloid, Endothelial Cell, Mural and Lymph Analysis###
+
+```{r include=FALSE}
+set.seed(1234)
+library(Seurat)
+library(Signac)
+library(chromVAR)
+library(dplyr)
+library(reticulate)
+library(hdf5r)
+library(scales)
+library(ggplot2)
+library(openxlsx)
+library(readxl)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(org.Mm.eg.db)
+library(JASPAR2020)
+library(TFBSTools)
+library(harmony)
+library(pheatmap)
+library(EnhancedVolcano)
+library(ggrepel)
+library(tidyr)
+library(gridExtra)
+library(ggpubr)
+```
+####  Load data  ####
+
+```{r echo=TRUE}
+#Load integrated file
+aggregated_samples <- readRDS("aggregated_global.rds")
+
+clust_colors <- c("darkorange2","mediumorchid2","steelblue3","olivedrab","indianred1","hotpink","darkred","green3","cyan")
+treatment_colors <-c("lightskyblue","pink", "steelblue4","red3")    
+```
+
+## Endothelial Cells
+```{r echo=TRUE}
+
+#Subset Endothelial_Cells (EC) population
+
+aggregated_Endothelial_Cells <- subset(aggregated_samples, idents = "Endothelial Cells")
+
+```
+###Re-normalize and re-run PCA analysis (repeat after contamination removal)
+
+```{r echo=TRUE}
+
+aggregated_Endothelial_Cells <- SCTransform(aggregated_Endothelial_Cells, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+
+aggregated_Endothelial_Cells <- RunPCA(aggregated_Endothelial_Cells, npcs = 50)
+aggregated_Endothelial_Cells <- RunHarmony(aggregated_Endothelial_Cells, 
+                              group.by.vars = "orig.ident",
+                              reduction = "pca", assay.use = "SCT", reduction.save = "harmony_pca",project.dim= F)
+aggregated_Endothelial_Cells <- FindNeighbors(object = aggregated_Endothelial_Cells, dims = 1:50, reduction = "harmony_pca")
+
+DefaultAssay(aggregated_Endothelial_Cells) <- "SCT"
+
+FindDimNumber(aggregated_Endothelial_Cells)
+
+ElbowPlot(aggregated_Endothelial_Cells, ndims = 50, reduction = "lsi")
+aggregated_Endothelial_Cells <- RunUMAP(aggregated_Endothelial_Cells, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+DefaultAssay(aggregated_Endothelial_Cells) <- "peakunion"
+aggregated_Endothelial_Cells <- FindTopFeatures(aggregated_Endothelial_Cells, min.cutoff = 10)
+aggregated_Endothelial_Cells<- RunTFIDF(aggregated_Endothelial_Cells)
+aggregated_Endothelial_Cells <- RunSVD(aggregated_Endothelial_Cells)
+
+ElbowPlot(aggregated_Endothelial_Cells, ndims = 50, reduction = "lsi")
+
+aggregated_Endothelial_Cells <- RunUMAP(object = aggregated_Endothelial_Cells, reduction = 'harmony_lsi', dims = 2:50, reduction.name = "umap_peakunion", reduction.key = "peakunionUMAP_")
+
+DefaultAssay(aggregated_Endothelial_Cells) <- "SCT"
+aggregated_Endothelial_Cells <- FindMultiModalNeighbors(
+  object = aggregated_Endothelial_Cells,
+  reduction.list = list("harmony_pca", "harmony_lsi"), 
+  dims.list = list(1:30, 2:30),# Determinded to be optimal amount of dims through visualization
+  modality.weight.name = c("SCT.weight","peakunion.weight"),
+  verbose = TRUE
+)
+aggregated_Endothelial_Cells <- RunUMAP(
+  object = aggregated_Endothelial_Cells,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNN_UMAP_",
+  verbose = TRUE,
+)
+
+```
+### Check for potential contamination (skip if already preformed)
+```{r echo=TRUE}
+
+aggregated_Endothelial_Cells<- FindClusters(aggregated_Endothelial_Cells, graph.name = "wsnn", algorithm = 3, resolution = seq(.1,.5,.1) )
+
+Idents(aggregated_Endothelial_Cells) <- aggregated_Endothelial_Cells$wsnn_res.0.5
+
+quick_CT_plot(aggregated_Endothelial_Cells, 2,"WNN_umap",legend = F,label = T,font.size = 8)
+quick_cond_plot(aggregated_Endothelial_Cells, 2,"WNN_umap",legend = F)
+annotation_markers <- c("Myh6","Ttn","Tnnt2","Ryr2", #Cardiomyocytes
+                        "Col1a1","Postn","Pdgfra","Gsn","Htra3",#Cardiac Fibroblasts
+                        "Cdh5","Fabp4","Pecam1","Kdr",#Endothelial Cells
+                        "Rgs5","Kcnj8","P2ry14","Pdgfrb","Vtn",#Mural cells
+                        "Mrc1","Cd68","C1qa","Ms4a7","Ccr2","Cx3cr1",#Myeloid Cells
+                        "Cd79a","Ikzf3","Ms4a1","Skap1",#Lymphoid Cells
+                        "Upk3b","Upk1b","Clu","Dmkn",# Epicardial cells
+                        "Kcna1","Kcna2","Cdh19","Plp1")#Schwann cells
+
+DotPlot_SCT(seurat_obj = aggregated_Endothelial_Cells, gene_vector = annotation_markers)
+
+contaminated <- Cells(subset(aggregated_Endothelial_Cells, idents = "9") )
+low_quality <- readLines("low_quality_BCs+CM+CFv2.txt")
+low_quality <- c(low_quality,contaminated)
+writeLines(low_quality, "low_quality_BCs+CM+CFv2+EC.txt")
+
+aggregated_Endothelial_Cells <- subset(aggregated_Endothelial_Cells, idents = "9", invert = T) 
+
+##Go back to redo normalization and check again
+
+```
+## Annotate (use fotplot above to double check for contamination)
+```{r echo=TRUE}
+aggregated_Endothelial_Cells<- FindClusters(aggregated_Endothelial_Cells, graph.name = "wsnn", algorithm = 3, resolution = seq(.1,.5,.1) )
+
+Idents(aggregated_Endothelial_Cells) <- aggregated_Endothelial_Cells$wsnn_res.0.3
+
+#Use markers to identify sub-cell types
+annotation_markers <- c( "Cdh5","Pecam1",#General EC
+                         "Fabp4","Vegfc",#Vasc EC
+                          "Cdh11","Npr3",#Endocardium
+                         "Mki67","Aurkb", # Proliferative EC
+                        "Lyve1","Flt4",#Lymphoid EC
+                        "Hbb-bs","Hba-a1"#Arterial EC
+                        )
+##"Mctp1","Zfp521"#Venous ECs
+
+DotPlot_SCT(seurat_obj = aggregated_Endothelial_Cells, gene_vector = annotation_markers)
+quick_CT_plot(aggregated_Endothelial_Cells, 2,"WNN_umap",legend = F,label = T,font.size = 8)
+quick_cond_plot(aggregated_Endothelial_Cells, 2,"WNN_umap",legend = F)
+
+Endothelial_Cells_cell_types <- c("VEC1","VEC2","Art_EC","VEC3","EndoC","VEC4","LEC","VEC_Prol")
+aggregated_Endothelial_Cells@active.ident<-factor(aggregated_Endothelial_Cells@active.ident, labels = Endothelial_Cells_cell_types)
+Endothelial_Cells_cell_levels <- c("VEC1","VEC2","VEC3","VEC4","EndoC","VEC_Prol","LEC","Art_EC")
+aggregated_Endothelial_Cells@active.ident<-factor(aggregated_Endothelial_Cells@active.ident, levels = Endothelial_Cells_cell_levels)
+
+aggregated_Endothelial_Cells$Cell_state <- Idents(aggregated_Endothelial_Cells)
+
+annotation_markers <- c( "Cdh5","Pecam1",#General EC
+                         "Fabp4","Vegfc",#Vasc EC
+                          "Cdh11","Npr3",#Endocardium
+                         "Mki67","Aurkb", # Proliferative EC
+                        "Lyve1","Flt4",#Lymphoid EC
+                        "Hbb-bs","Hba-a1"#Arterial EC
+                        )
+
+DotPlot_SCT(seurat_obj = aggregated_Endothelial_Cells, gene_vector = annotation_markers,pt.size = 14)
+ggsave("EC_dotplot.tif", height = 5.5,width = 5.5)
+
+#Identify DEGS
+DefaultAssay(aggregated_Endothelial_Cells) <- "SCT"
+EC_all_DEGs <- FindAllMarkers(aggregated_Endothelial_Cells, only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT", return.thresh = 1 )
+EC_all_DEGs$gene <- sub("\\..*", "", rownames(EC_all_DEGs))
+EC_all_DEGs <- EC_all_DEGs %>% group_by(cluster) %>% mutate(BH_p_val_adj = p.adjust(p_val, method = "BH")) 
+EC_all_DEGs <- EC_all_DEGs[!grepl("mt-",EC_all_DEGs$gene),]#Mitochondrial RNA is typically removed during nuclear exraction but some can be bound to ER during extraction so it is removed 
+EC_all_DEGs <- as.data.frame(EC_all_DEGs)
+EC_all_DEGs_sig <- subset(EC_all_DEGs, BH_p_val_adj < 0.05)
+write.xlsx(EC_all_DEGs_sig,"EC_all_DEGs_sig.xlsx")
+
+#These functions can be found in the helper functions script
+proportion_plots(aggregated_Endothelial_Cells, cond_color = treatment_colors, clust_color = clust_colors, name.clust = "EC_prop_sub.tif", name.cond = "EC_prop_cond.tif",height = 4, width = 4)
+
+prop_heatmap(aggregated_Endothelial_Cells, "EC_heat_prop.tif")
+
+quick_CT_plot(aggregated_Endothelial_Cells, 1,"WNN_umap",legend = F,label = T, font.size = 10)
+ggsave("Endothelial_Cells_umap_sub.tiff", height = 5,width = 5)
+quick_cond_plot(aggregated_Endothelial_Cells, 1,"WNN_umap",legend = F)
+ggsave("Endothelial_Cells_umap_cond.tiff", height = 5,width = 5)
+
+#Save dataset
+saveRDS(aggregated_Endothelial_Cells,"Endothelial_Cells.rds")
+
+```
+## Condition comparisons
+```{r echo=TRUE}
+#Perform differential expression analysis between treatment Sham and MI treatments using MAST
+
+EC_SalShamvMalSham  <- FindMarkers(aggregated_Endothelial_Cells, ident.1 = "Saline_Sham", ident.2 = "Malonate_Sham",group.by = "orig.ident",only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT",)
+    EC_SalShamvMalSham$BH_p_val_adj <- p.adjust(EC_SalShamvMalSham$p_val, method='BH')
+    EC_SalShamvMalSham$gene <- rownames(EC_SalShamvMalSham)
+    EC_SalShamvMalSham <- EC_SalShamvMalSham[!grepl("mt-",EC_SalShamvMalSham$gene),]
+    EC_SalShamvMalSham$comparison <- "Saline Sham vs Malonate Sham"
+EC_SalShamvMalSham_sig <- subset(EC_SalShamvMalSham, BH_p_val_adj < 0.05 )
+
+lab_italics <- paste0("italic('", rownames(EC_SalShamvMalSham), "')")
+select_labels <-c(head(row.names(subset(EC_SalShamvMalSham, avg_log2FC > 0)),n=15),head(row.names(subset(EC_SalShamvMalSham, avg_log2FC < 0)),n=3))
+select_labels <- paste0("italic('",c(head(row.names(subset(EC_SalShamvMalSham, avg_log2FC > 0)),n=15),head(row.names(subset(EC_SalShamvMalSham, avg_log2FC < 0)),n=3)), "')")
+
+up_down_volcano(EC_SalShamvMalSham, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("Saline Sham Upregulated Genes (",sum(EC_SalShamvMalSham_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("Malonate Sham upregulated Genes (",sum(EC_SalShamvMalSham_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "EC_SalShamvMalSham_volcano.tif", up_x = max(EC_SalShamvMalSham$avg_log2FC)+1.5,down_x = min(EC_SalShamvMalSham$avg_log2FC)-1.5,cols = c("pink2","lightskyblue3","grey" ))
+
+EC_SalMIvMalMI <- FindMarkers(aggregated_Endothelial_Cells, ident.1 = "Saline_MI", ident.2 = "Malonate_MI",group.by = "orig.ident",only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT",)
+    EC_SalMIvMalMI$BH_p_val_adj <- p.adjust(EC_SalMIvMalMI$p_val, method='BH')
+    EC_SalMIvMalMI$gene <- rownames(EC_SalMIvMalMI)
+    EC_SalMIvMalMI <- EC_SalMIvMalMI[!grepl("mt-",EC_SalMIvMalMI$gene),]
+    EC_SalMIvMalMI$comparison <- "Saline MI vs Malonate MI"
+EC_SalMIvMalMI_sig <- subset(EC_SalMIvMalMI, BH_p_val_adj < 0.05 )
+
+lab_italics <- paste0("italic('", rownames(EC_SalMIvMalMI), "')")
+select_labels <-c(head(row.names(subset(EC_SalMIvMalMI, avg_log2FC > 0)),n=15),head(row.names(subset(EC_SalMIvMalMI, avg_log2FC < 0)),n=15))
+select_labels <- paste0("italic('",c(head(row.names(subset(EC_SalMIvMalMI, avg_log2FC > 0)),n=15) ,head(row.names(subset(EC_SalMIvMalMI, avg_log2FC < 0)),n=15)), "')")
+
+up_down_volcano(EC_SalMIvMalMI, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("Saline MI Upregulated Genes (",sum(EC_SalMIvMalMI_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("Malonate MI upregulated Genes (",sum(EC_SalMIvMalMI_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "EC_SalMIvMalMI_volcano.tif", up_x = max(EC_SalMIvMalMI$avg_log2FC)+1,down_x = min(EC_SalMIvMalMI$avg_log2FC)-1,cols = c("red3","steelblue4","grey" ))
+
+#Save combined data
+combined_EC_DESeq <- rbind(EC_SalShamvMalSham_sig,EC_SalMIvMalMI_sig)
+write.xlsx(combined_EC_DESeq,"EC_Sal_vs_Mal_sig.xlsx")
+
+```
+## Mural Cells
+```{r echo=TRUE}
+
+#Subset Mural (Mural) population
+
+aggregated_Mural <- subset(aggregated_samples, idents = "Mural Cells")
+
+```
+###Re-normalize and re-run PCA analysis (repeat after contamination removal)
+
+```{r echo=TRUE}
+
+aggregated_Mural <- SCTransform(aggregated_Mural, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+
+aggregated_Mural <- RunPCA(aggregated_Mural, npcs = 50)
+aggregated_Mural <- RunHarmony(aggregated_Mural, 
+                              group.by.vars = "orig.ident",
+                              reduction = "pca", assay.use = "SCT", reduction.save = "harmony_pca",project.dim= F)
+aggregated_Mural <- FindNeighbors(object = aggregated_Mural, dims = 1:50, reduction = "harmony_pca")
+
+DefaultAssay(aggregated_Mural) <- "SCT"
+
+FindDimNumber(aggregated_Mural)
+
+ElbowPlot(aggregated_Mural, ndims = 50, reduction = "lsi")
+aggregated_Mural <- RunUMAP(aggregated_Mural, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+DefaultAssay(aggregated_Mural) <- "peakunion"
+aggregated_Mural <- FindTopFeatures(aggregated_Mural, min.cutoff = 10)
+aggregated_Mural<- RunTFIDF(aggregated_Mural)
+aggregated_Mural <- RunSVD(aggregated_Mural)
+
+ElbowPlot(aggregated_Mural, ndims = 50, reduction = "lsi")
+
+aggregated_Mural <- RunUMAP(object  = aggregated_Mural, reduction = 'harmony_lsi', dims = 2:50, reduction.name = "umap_peakunion", reduction.key = "peakunionUMAP_")
+
+DefaultAssay(aggregated_Mural) <- "SCT"
+aggregated_Mural <- FindMultiModalNeighbors(
+  object = aggregated_Mural,
+  reduction.list = list("harmony_pca", "harmony_lsi"), 
+  dims.list = list(1:30, 2:30),# Determinded to be optimal amount of dims through visualization
+  modality.weight.name = c("SCT.weight","peakunion.weight"),
+  verbose = TRUE
+)
+aggregated_Mural <- RunUMAP(
+  object = aggregated_Mural,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNN_UMAP_",
+  verbose = TRUE,
+)
+
+```
+## Check for contamination
+```{r echo=TRUE}
+
+
+aggregated_Mural<- FindClusters(aggregated_Mural, graph.name = "wsnn", algorithm = 3, resolution = seq(.1,.5,.1) )
+
+Idents(aggregated_Mural) <- aggregated_Mural$wsnn_res.0.5
+
+quick_CT_plot(aggregated_Mural, 2,"WNN_umap",legend = F,label = T,font.size = 8)
+quick_cond_plot(aggregated_Mural, 2,"WNN_umap",legend = F)
+annotation_markers <- c("Myh6","Ttn","Tnnt2","Ryr2", #Cardiomyocytes
+                        "Col1a1","Postn","Pdgfra","Gsn","Htra3",#Cardiac Fibroblasts
+                        "Cdh5","Fabp4","Pecam1","Kdr",#Endothelial Cells
+                        "Rgs5","Kcnj8","P2ry14","Pdgfrb","Vtn",#Mural cells
+                        "Mrc1","Cd68","C1qa","Ms4a7","Ccr2","Cx3cr1",#Myeloid Cells
+                        "Cd79a","Ikzf3","Ms4a1","Skap1",#Lymphoid Cells
+                        "Upk3b","Upk1b","Clu","Dmkn",# Epicardial cells
+                        "Kcna1","Kcna2","Cdh19","Plp1")#Schwann cells
+
+DotPlot_SCT(seurat_obj = aggregated_Mural, gene_vector = annotation_markers)
+
+contaminated <- Cells(subset(aggregated_Mural, idents = "4") )
+low_quality <- readLines("low_quality_BCs+CM+CFv2+EC.txt")
+low_quality <- c(low_quality,contaminated)
+writeLines(low_quality, "low_quality_BCs+CM+CFv2+EC+Mur.txt")
+
+aggregated_Mural <- subset(aggregated_Mural, idents = "4", invert = T) 
+
+##Go back to redo normalization and check again
+
+
+```
+## Annotate
+```{r echo=TRUE}
+aggregated_Mural<- FindClusters(aggregated_Mural, graph.name = "wsnn", algorithm = 3, resolution = seq(.1,.5,.1) )
+
+Idents(aggregated_Mural) <- aggregated_Mural$wsnn_res.0.5
+
+#Use markers to identify sub-cell types
+annotation_markers <- c( "Rgs5","Mcam",#General Mural cells
+                         "Pdgfrb","P2ry14","Cspg4",#Pericytes
+                         "Acta2","Tagln","Myl9" # Smooth Muscle Cells
+                        )
+
+DotPlot_SCT(seurat_obj = aggregated_Mural, gene_vector = annotation_markers)
+
+
+Mural_cell_types <- c("PC1","PC2","PC3","SMC")
+aggregated_Mural@active.ident<-factor(aggregated_Mural@active.ident, labels = Mural_cell_types)
+
+Mural_cell_levels <- c("PC1","PC2","PC3","SMC")
+aggregated_Mural@active.ident<-factor(aggregated_Mural@active.ident, levels = Mural_cell_levels)
+
+aggregated_Mural$Cell_state <- Idents(aggregated_Mural)
+
+annotation_markers <- c( "Rgs5","Mcam",#General Mural cells
+                         "Pdgfrb","P2ry14","Cspg4",#Pericytes
+                         "Acta2","Tagln","Myl9" # Smooth Muscle Cells
+                        )
+
+DotPlot_SCT(seurat_obj = aggregated_Mural, gene_vector = annotation_markers,pt.size = 14)
+ggsave("Mural_dotplot.tif", height = 5,width = 5)
+
+#Identify DEGS
+DefaultAssay(aggregated_Mural) <- "SCT"
+Mural_all_DEGs <- FindAllMarkers(aggregated_Mural, only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT", return.thresh = 1 )
+Mural_all_DEGs$gene <- sub("\\..*", "", rownames(Mural_all_DEGs))
+Mural_all_DEGs <- Mural_all_DEGs %>% group_by(cluster) %>% mutate(BH_p_val_adj = p.adjust(p_val, method = "BH")) 
+Mural_all_DEGs <- Mural_all_DEGs[!grepl("mt-",Mural_all_DEGs$gene),]#Mitochondrial RNA is typically removed during nuclear exraction but some can be bound to ER during extraction so it is removed 
+Mural_all_DEGs <- as.data.frame(Mural_all_DEGs)
+Mural_all_DEGs_sig <- subset(Mural_all_DEGs, BH_p_val_adj < 0.05)
+write.xlsx(Mural_all_DEGs_sig,"Mural_all_DEGs_sig.xlsx")
+
+#These functions can be found in the helper functions script
+proportion_plots(aggregated_Mural, cond_color = treatment_colors, clust_color = clust_colors, name.clust = "Mural_prop_sub.tif", name.cond = "Mural_prop_cond.tif",height = 4, width = 4)
+
+prop_heatmap(aggregated_Mural, "Mural_heat_prop.tif")
+
+quick_CT_plot(aggregated_Mural, 2,"WNN_umap",legend = F,label = T, font.size = 14)
+ggsave("Mural_Cells_umap_sub.tiff", height = 5,width = 5)
+quick_cond_plot(aggregated_Mural, 2,"WNN_umap",legend = F)
+ggsave("Mural_Cells_umap_cond.tiff", height = 5,width = 5)
+
+#Save dataset
+saveRDS(aggregated_Mural,"Mural.rds")
+
+```
+## Condition comparisons
+```{r echo=TRUE}
+#Perform differential expression analysis between treatment Sham and MI treatments using MAST
+
+Mural_SalShamvMalSham  <- FindMarkers(aggregated_Mural, ident.1 = "Saline_Sham", ident.2 = "Malonate_Sham",group.by = "orig.ident",only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT",)
+    Mural_SalShamvMalSham$BH_p_val_adj <- p.adjust(Mural_SalShamvMalSham$p_val, method='BH')
+    Mural_SalShamvMalSham$gene <- rownames(Mural_SalShamvMalSham)
+    Mural_SalShamvMalSham <- Mural_SalShamvMalSham[!grepl("mt-",Mural_SalShamvMalSham$gene),]
+    Mural_SalShamvMalSham$comparison <- "Saline Sham vs Malonate Sham"
+Mural_SalShamvMalSham_sig <- subset(Mural_SalShamvMalSham, BH_p_val_adj < 0.05 )
+
+lab_italics <- paste0("italic('", rownames(Mural_SalShamvMalSham), "')")
+select_labels <-c(head(row.names(subset(Mural_SalShamvMalSham, avg_log2FC > 0)),n=15),head(row.names(subset(Mural_SalShamvMalSham, avg_log2FC < 0)),n=5))
+select_labels <- paste0("italic('",c(head(row.names(subset(Mural_SalShamvMalSham, avg_log2FC > 0)),n=15),head(row.names(subset(Mural_SalShamvMalSham, avg_log2FC < 0)),n=5)), "')")
+
+up_down_volcano(Mural_SalShamvMalSham, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("Saline Sham Upregulated Genes (",sum(Mural_SalShamvMalSham_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("Malonate Sham upregulated Genes (",sum(Mural_SalShamvMalSham_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "Mural_SalShamvMalSham_volcano.tif", up_x = max(Mural_SalShamvMalSham$avg_log2FC)+1.5,down_x = min(Mural_SalShamvMalSham$avg_log2FC)-1.5,cols = c("pink2","lightskyblue3","grey" ))
+
+Mural_SalMIvMalMI <- FindMarkers(aggregated_Mural, ident.1 = "Saline_MI", ident.2 = "Malonate_MI",group.by = "orig.ident",only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT",)
+    Mural_SalMIvMalMI$BH_p_val_adj <- p.adjust(Mural_SalMIvMalMI$p_val, method='BH')
+    Mural_SalMIvMalMI$gene <- rownames(Mural_SalMIvMalMI)
+    Mural_SalMIvMalMI <- Mural_SalMIvMalMI[!grepl("mt-",Mural_SalMIvMalMI$gene),]
+    Mural_SalMIvMalMI$comparison <- "Saline MI vs Malonate MI"
+Mural_SalMIvMalMI_sig <- subset(Mural_SalMIvMalMI, BH_p_val_adj < 0.05 )
+
+lab_italics <- paste0("italic('", rownames(Mural_SalMIvMalMI), "')")
+select_labels <-c(head(row.names(subset(Mural_SalMIvMalMI, avg_log2FC > 0)),n=8),head(row.names(subset(Mural_SalMIvMalMI, avg_log2FC < 0)),n=15))
+select_labels <- paste0("italic('",c(head(row.names(subset(Mural_SalMIvMalMI, avg_log2FC > 0)),n=8) ,head(row.names(subset(Mural_SalMIvMalMI, avg_log2FC < 0)),n=15)), "')")
+
+up_down_volcano(Mural_SalMIvMalMI, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("Saline MI Upregulated Genes (",sum(Mural_SalMIvMalMI_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("Malonate MI upregulated Genes (",sum(Mural_SalMIvMalMI_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "Mural_SalMIvMalMI_volcano.tif", up_x = max(Mural_SalMIvMalMI$avg_log2FC)+1,down_x = min(Mural_SalMIvMalMI$avg_log2FC)-1,cols = c("red3","steelblue4","grey" ))
+
+#Save combined data
+combined_Mural_DESeq <- rbind(Mural_SalShamvMalSham_sig,Mural_SalMIvMalMI_sig)
+write.xlsx(combined_Mural_DESeq,"Mural_Sal_vs_Mal_sig.xlsx")
+
+```
+## Myeloid Cells
+```{r echo=TRUE}
+
+#Subset Myeloid (Mye) population
+
+aggregated_Myeloid <- subset(aggregated_samples, idents = "Myeloid Cells")
+
+```
+###Re-normalize and re-run PCA analysis (repeat after contamination removal)
+
+```{r echo=TRUE}
+
+aggregated_Myeloid <- SCTransform(aggregated_Myeloid, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+
+aggregated_Myeloid <- RunPCA(aggregated_Myeloid, npcs = 50)
+aggregated_Myeloid <- RunHarmony(aggregated_Myeloid, 
+                              group.by.vars = "orig.ident",
+                              reduction = "pca", assay.use = "SCT", reduction.save = "harmony_pca",project.dim= F)
+aggregated_Myeloid <- FindNeighbors(object = aggregated_Myeloid, dims = 1:50, reduction = "harmony_pca")
+
+DefaultAssay(aggregated_Myeloid) <- "SCT"
+
+FindDimNumber(aggregated_Myeloid)
+
+ElbowPlot(aggregated_Myeloid, ndims = 50, reduction = "lsi")
+aggregated_Myeloid <- RunUMAP(aggregated_Myeloid, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+DefaultAssay(aggregated_Myeloid) <- "peakunion"
+aggregated_Myeloid <- FindTopFeatures(aggregated_Myeloid, min.cutoff = 10)
+aggregated_Myeloid<- RunTFIDF(aggregated_Myeloid)
+aggregated_Myeloid <- RunSVD(aggregated_Myeloid)
+
+ElbowPlot(aggregated_Myeloid, ndims = 50, reduction = "lsi")
+
+aggregated_Myeloid <- RunUMAP(object = aggregated_Myeloid, reduction = 'harmony_lsi', dims = 2:50, reduction.name = "umap_peakunion", reduction.key = "peakunionUMAP_")
+
+DefaultAssay(aggregated_Myeloid) <- "SCT"
+aggregated_Myeloid <- FindMultiModalNeighbors(
+  object = aggregated_Myeloid,
+  reduction.list = list("harmony_pca", "harmony_lsi"), 
+  dims.list = list(1:50, 2:30),# Determinded to be optimal amount of dims through visualization
+  modality.weight.name = c("SCT.weight","peakunion.weight"),
+  verbose = TRUE
+)
+aggregated_Myeloid <- RunUMAP(
+  object = aggregated_Myeloid,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNN_UMAP_",
+  verbose = TRUE,
+)
+```
+## Check for contamination
+```{r echo=TRUE}
+
+aggregated_Myeloid<- FindClusters(aggregated_Myeloid, graph.name = "wsnn", algorithm = 3, resolution = seq(.2,1,.2) )
+
+Idents(aggregated_Myeloid) <- aggregated_Myeloid$wsnn_res.1
+
+quick_CT_plot(aggregated_Myeloid, 2,"WNN_umap",legend = F,label = T,font.size = 8)
+quick_cond_plot(aggregated_Myeloid, 2,"WNN_umap",legend = F)
+annotation_markers <- c("Myh6","Ttn","Tnnt2","Ryr2", #Cardiomyocytes
+                        "Col1a1","Postn","Pdgfra","Gsn","Htra3",#Cardiac Fibroblasts
+                        "Cdh5","Fabp4","Pecam1","Kdr",#Endothelial Cells
+                        "Rgs5","Kcnj8","P2ry14","Pdgfrb","Vtn",#Mural cells
+                        "Mrc1","Cd68","C1qa","Ms4a7","Ccr2","Cx3cr1",#Myeloid Cells
+                        "Cd79a","Ikzf3","Ms4a1","Skap1",#Lymphoid Cells
+                        "Upk3b","Upk1b","Clu","Dmkn",# Epicardial cells
+                        "Kcna1","Kcna2","Cdh19","Plp1")#Schwann cells
+
+DotPlot_SCT(seurat_obj = aggregated_Myeloid, gene_vector = annotation_markers)
+
+##No clear contamination detected
+
+```
+## Annotate
+```{r echo=TRUE}
+#Use markers to identify sub-cell types
+annotation_markers <- c("Ptprc","Arhgap15","Ccr2","Cx3cr1", # Monocyte
+                        "Itgam","Mrc1","Cd68","C1qa","Lyve1"#Myeloid Cells
+                        
+                        )
+
+DotPlot_SCT(seurat_obj = aggregated_Myeloid, gene_vector = annotation_markers)
+
+
+Myeloid_cell_types <- c("MP1","MP2","MP3","MP1","MP4","Mono","MP5")
+aggregated_Myeloid@active.ident<-factor(aggregated_Myeloid@active.ident, labels = Myeloid_cell_types)
+
+Myeloid_cell_levels <- c("Mono","MP1","MP2","MP3","MP4","MP5")
+aggregated_Myeloid@active.ident<-factor(aggregated_Myeloid@active.ident, levels = Myeloid_cell_levels)
+
+aggregated_Myeloid$Cell_state <- Idents(aggregated_Myeloid)
+
+annotation_markers <- c("Ptprc","Arhgap15","Ccr2","Cx3cr1", # Monocyte
+                        "Itgam","Mrc1","Cd68","C1qa","Lyve1"#Myeloid Cells
+                        
+                        )
+
+DotPlot_SCT(seurat_obj = aggregated_Myeloid, gene_vector = annotation_markers,pt.size = 14)
+ggsave("Mye_dotplot.tif", height = 5,width = 5)
+
+#Identify DEGS
+DefaultAssay(aggregated_Myeloid) <- "SCT"
+Myeloid_all_DEGs <- FindAllMarkers(aggregated_Myeloid, only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT", return.thresh = 1 )
+Myeloid_all_DEGs$gene <- sub("\\..*", "", rownames(Myeloid_all_DEGs))
+Myeloid_all_DEGs <- Myeloid_all_DEGs %>% group_by(cluster) %>% mutate(BH_p_val_adj = p.adjust(p_val, method = "BH")) 
+Myeloid_all_DEGs <- Myeloid_all_DEGs[!grepl("mt-",Myeloid_all_DEGs$gene),]#Mitochondrial RNA is typically removed during nuclear exraction but some can be bound to ER during extraction so it is removed 
+Myeloid_all_DEGs <- as.data.frame(Myeloid_all_DEGs)
+Myeloid_all_DEGs_sig <- subset(Myeloid_all_DEGs, BH_p_val_adj < 0.05)
+write.xlsx(Myeloid_all_DEGs_sig,"Myeloid_all_DEGs_sig.xlsx")
+
+#These functions can be found in the helper functions script
+proportion_plots(aggregated_Myeloid, cond_color = treatment_colors, clust_color = clust_colors, name.clust = "Mye_prop_sub.tif", name.cond = "Mye_prop_cond.tif",height = 4, width = 4)
+
+prop_heatmap(aggregated_Myeloid, "Mye_heat_prop.tif")
+
+quick_CT_plot(aggregated_Myeloid, 2,"WNN_umap",legend = F,label = T, font.size = 12)
+ggsave("Myeloid_Cells_umap_sub.tiff", height = 5,width = 5)
+quick_cond_plot(aggregated_Myeloid, 2,"WNN_umap",legend = F)
+ggsave("Myeloid_Cells_umap_cond.tiff", height = 5,width = 5)
+
+#Save dataset
+saveRDS(aggregated_Myeloid,"Myeloid.rds")
+
+```
+## Condition comparisons
+```{r echo=TRUE}
+#Perform differential expression analysis between treatment Sham and MI treatments using MAST
+
+Mye_SalShamvMalSham  <- FindMarkers(aggregated_Myeloid, ident.1 = "Saline_Sham", ident.2 = "Malonate_Sham",group.by = "orig.ident",only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT",)
+    Mye_SalShamvMalSham$BH_p_val_adj <- p.adjust(Mye_SalShamvMalSham$p_val, method='BH')
+    Mye_SalShamvMalSham$gene <- rownames(Mye_SalShamvMalSham)
+    Mye_SalShamvMalSham <- Mye_SalShamvMalSham[!grepl("mt-",Mye_SalShamvMalSham$gene),]
+    Mye_SalShamvMalSham$comparison <- "Saline Sham vs Malonate Sham"
+Mye_SalShamvMalSham_sig <- subset(Mye_SalShamvMalSham, BH_p_val_adj < 0.05 )
+
+lab_italics <- paste0("italic('", rownames(Mye_SalShamvMalSham), "')")
+select_labels <-c(head(row.names(subset(Mye_SalShamvMalSham, avg_log2FC > 0)),n=15),head(row.names(subset(Mye_SalShamvMalSham, avg_log2FC < 0)),n=10))
+select_labels <- paste0("italic('",c(head(row.names(subset(Mye_SalShamvMalSham, avg_log2FC > 0)),n=15),head(row.names(subset(Mye_SalShamvMalSham, avg_log2FC < 0)),n=10)), "')")
+
+up_down_volcano(Mye_SalShamvMalSham, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("Saline Sham Upregulated Genes (",sum(Mye_SalShamvMalSham_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("Malonate Sham upregulated Genes (",sum(Mye_SalShamvMalSham_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "Mye_SalShamvMalSham_volcano.tif", up_x = max(Mye_SalShamvMalSham$avg_log2FC)+1.5,down_x = min(Mye_SalShamvMalSham$avg_log2FC)-1.5,cols = c("pink2","lightskyblue3","grey" ))
+
+Mye_SalMIvMalMI <- FindMarkers(aggregated_Myeloid, ident.1 = "Saline_MI", ident.2 = "Malonate_MI",group.by = "orig.ident",only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT",)
+    Mye_SalMIvMalMI$BH_p_val_adj <- p.adjust(Mye_SalMIvMalMI$p_val, method='BH')
+    Mye_SalMIvMalMI$gene <- rownames(Mye_SalMIvMalMI)
+    Mye_SalMIvMalMI <- Mye_SalMIvMalMI[!grepl("mt-",Mye_SalMIvMalMI$gene),]
+    Mye_SalMIvMalMI$comparison <- "Saline MI vs Malonate MI"
+Mye_SalMIvMalMI_sig <- subset(Mye_SalMIvMalMI, BH_p_val_adj < 0.05 )
+
+lab_italics <- paste0("italic('", rownames(Mye_SalMIvMalMI), "')")
+select_labels <-c(head(row.names(subset(Mye_SalMIvMalMI, avg_log2FC > 0)),n=8),head(row.names(subset(Mye_SalMIvMalMI, avg_log2FC < 0)),n=15))
+select_labels <- paste0("italic('",c(head(row.names(subset(Mye_SalMIvMalMI, avg_log2FC > 0)),n=8) ,head(row.names(subset(Mye_SalMIvMalMI, avg_log2FC < 0)),n=15)), "')")
+
+up_down_volcano(Mye_SalMIvMalMI, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("Saline MI Upregulated Genes (",sum(Mye_SalMIvMalMI_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("Malonate MI upregulated Genes (",sum(Mye_SalMIvMalMI_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "Mye_SalMIvMalMI_volcano.tif", up_x = max(Mye_SalMIvMalMI$avg_log2FC)+1.5,down_x = min(Mye_SalMIvMalMI$avg_log2FC)-1,cols = c("red3","steelblue4","grey" ))
+
+#Save combined data
+combined_Mye_DESeq <- rbind(Mye_SalShamvMalSham_sig,Mye_SalMIvMalMI_sig)
+write.xlsx(combined_Mye_DESeq,"Mye_Sal_vs_Mal_sig.xlsx")
+```
+## Lymphoid Cells
+```{r echo=TRUE}
+
+#Subset Lymphoid (Lymph) population
+
+aggregated_Lymphoid <- subset(aggregated_samples, idents = "Lymphoid Cells")
+```
+###Re-normalize and re-run PCA analysis (repeat after contamination removal)
+
+```{r echo=TRUE}
+aggregated_Lymphoid <- SCTransform(aggregated_Lymphoid, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+
+aggregated_Lymphoid <- RunPCA(aggregated_Lymphoid, npcs = 50)
+aggregated_Lymphoid <- RunHarmony(aggregated_Lymphoid, 
+                              group.by.vars = "orig.ident",
+                              reduction = "pca", assay.use = "SCT", reduction.save = "harmony_pca",project.dim= F)
+aggregated_Lymphoid <- FindNeighbors(object = aggregated_Lymphoid, dims = 1:50, reduction = "harmony_pca")
+
+DefaultAssay(aggregated_Lymphoid) <- "SCT"
+
+FindDimNumber(aggregated_Lymphoid)
+
+ElbowPlot(aggregated_Lymphoid, ndims = 50, reduction = "lsi")
+aggregated_Lymphoid <- RunUMAP(aggregated_Lymphoid, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+DefaultAssay(aggregated_Lymphoid) <- "peakunion"
+aggregated_Lymphoid <- FindTopFeatures(aggregated_Lymphoid, min.cutoff = 10)
+aggregated_Lymphoid<- RunTFIDF(aggregated_Lymphoid)
+aggregated_Lymphoid <- RunSVD(aggregated_Lymphoid)
+
+ElbowPlot(aggregated_Lymphoid, ndims = 50, reduction = "lsi")
+
+aggregated_Lymphoid <- RunUMAP(object = aggregated_Lymphoid, reduction = 'harmony_lsi', dims = 2:50, reduction.name = "umap_peakunion", reduction.key = "peakunionUMAP_")
+
+DefaultAssay(aggregated_Lymphoid) <- "SCT"
+aggregated_Lymphoid <- FindMultiModalNeighbors(
+  object = aggregated_Lymphoid,
+  reduction.list = list("harmony_pca", "harmony_lsi"), 
+  dims.list = list(1:30, 2:10),# Determinded to be optimal amount of dims through visualization
+  modality.weight.name = c("SCT.weight","peakunion.weight"),
+  verbose = TRUE, k.nn = 5,knn.range = 5
+)
+aggregated_Lymphoid <- RunUMAP(
+  object = aggregated_Lymphoid,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNN_UMAP_",
+  verbose = TRUE,
+)
+
+aggregated_Lymphoid<- FindClusters(aggregated_Lymphoid, graph.name = "wsnn", algorithm = 3, resolution = seq(.1,.5,.1) )
+
+Idents(aggregated_Lymphoid) <- aggregated_Lymphoid$wsnn_res.0.5
+
+quick_CT_plot(aggregated_Lymphoid, 2,"WNN_umap",legend = F,label = T,font.size = 8)
+quick_cond_plot(aggregated_Lymphoid, 2,"WNN_umap",legend = F)
+annotation_markers <- c("Myh6","Ttn","Tnnt2","Ryr2", #Cardiomyocytes
+                        "Col1a1","Postn","Pdgfra","Gsn","Htra3",#Cardiac Fibroblasts
+                        "Cdh5","Fabp4","Pecam1","Kdr",#Endothelial Cells
+                        "Rgs5","Kcnj8","P2ry14","Pdgfrb","Vtn",#Mural cells
+                        "Mrc1","Cd68","C1qa","Ms4a7","Ccr2","Cx3cr1",#Myeloid Cells
+                        "Cd79a","Ikzf3","Ms4a1","Skap1",#Lymphoid Cells
+                        "Upk3b","Upk1b","Clu","Dmkn",# Epicardial cells
+                        "Kcna1","Kcna2","Cdh19","Plp1")#Schwann cells
+
+DotPlot_SCT(seurat_obj = aggregated_Lymphoid, gene_vector = annotation_markers)
+
+contaminated <- Cells(subset(aggregated_Lymphoid, idents = "3") )
+low_quality <- readLines("low_quality_BCs+CM+CFv2+EC+Mur.txt")
+low_quality <- c(low_quality,contaminated)
+writeLines(low_quality, "low_quality_BCs+CM+CFv2+EC+Mur+Lymph.txt")
+
+aggregated_Lymphoid <- subset(aggregated_Lymphoid, idents = "3", invert = T) 
+
+##Go back to redo normalization and check again
+
+```
+## Annotate after contamination removal
+```{r echo=TRUE}
+
+Idents(aggregated_Lymphoid) <- aggregated_Lymphoid$wsnn_res.0.4
+
+#Use markers to identify sub-cell types
+annotation_markers <- c(
+                        "Cd3g","Lat","Skap1", # T Cell
+                        "Ms4a1","Cd79a","Ly6d"# B Cell
+                         # NK cells have mix of both
+                        )
+
+DotPlot_SCT(seurat_obj = aggregated_Lymphoid, gene_vector = annotation_markers)
+quick_CT_plot(aggregated_Lymphoid, 2,"WNN_umap",legend = F,label = T,font.size = 8)
+quick_cond_plot(aggregated_Lymphoid, 2,"WNN_umap",legend = F)
+
+Lymph_cell_types <- c("TC","BC","NK")
+aggregated_Lymphoid@active.ident<-factor(aggregated_Lymphoid@active.ident, labels = Lymph_cell_types)
+
+aggregated_Lymphoid$Cell_state <- Idents(aggregated_Lymphoid)
+
+DotPlot_SCT(seurat_obj = aggregated_Lymphoid, gene_vector = annotation_markers)
+ggsave("Lymph_dotplot.tif", height = 8,width = 8)
+
+#Identify DEGS
+DefaultAssay(aggregated_Lymphoid) <- "SCT"
+Lymph_all_DEGs <- FindAllMarkers(aggregated_Lymphoid, only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT" )
+Lymph_all_DEGs$BH_p_val_adj <- p.adjust(Lymph_all_DEGs$p_val, method='BH')
+Lymph_all_DEGs$gene <- sub("\\..*", "", rownames(Lymph_all_DEGs))
+Lymph_all_DEGs <- Lymph_all_DEGs[!grepl("mt-",Lymph_all_DEGs$gene),]
+Lymph_all_DEGs_sig <- subset(Lymph_all_DEGs, BH_p_val_adj < 0.05)
+write.xlsx(Lymph_all_DEGs_sig,"Lymph_all_DEGs_sig.xlsx")
+
+quick_CT_plot(aggregated_Lymphoid, 2,"WNN_umap",legend = F,label = T, font.size = 14)
+ggsave("Lymphoid_Cells_umap_sub.tif", height = 5,width = 5)
+quick_cond_plot(aggregated_Lymphoid, 2,"WNN_umap",legend = F)
+ggsave("Lymphoid_Cells_umap_cond.tif", height = 5,width = 5)
+
+#Save dataset
+saveRDS(aggregated_Lymphoid,"Lymphoid.rds")
+
+```
+## Epicardial Cells
+```{r echo=TRUE}
+
+#Subset Epicardial population (Population so small and homogeneous its not worth assessing contamination)
+
+aggregated_Epicardial <- subset(aggregated_samples, idents = "Epicardial Cells")
+aggregated_Epicardial <- SCTransform(aggregated_Epicardial, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+
+aggregated_Epicardial <- RunPCA(aggregated_Epicardial, npcs = 50)
+aggregated_Epicardial <- RunHarmony(aggregated_Epicardial, 
+                              group.by.vars = "orig.ident",
+                              reduction = "pca", assay.use = "SCT", reduction.save = "harmony_pca",project.dim= F)
+aggregated_Epicardial <- FindNeighbors(object = aggregated_Epicardial, dims = 1:50, reduction = "harmony_pca")
+
+DefaultAssay(aggregated_Epicardial) <- "SCT"
+
+FindDimNumber(aggregated_Epicardial)
+
+ElbowPlot(aggregated_Epicardial, ndims = 50, reduction = "lsi")
+aggregated_Epicardial <- RunUMAP(aggregated_Epicardial, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+DefaultAssay(aggregated_Epicardial) <- "peakunion"
+aggregated_Epicardial <- FindTopFeatures(aggregated_Epicardial, min.cutoff = 10)
+aggregated_Epicardial<- RunTFIDF(aggregated_Epicardial)
+aggregated_Epicardial <- RunSVD(aggregated_Epicardial)
+
+ElbowPlot(aggregated_Epicardial, ndims = 50, reduction = "lsi")
+
+aggregated_Epicardial <- RunUMAP(object = aggregated_Epicardial, reduction = 'harmony_lsi', dims = 2:50, reduction.name = "umap_peakunion", reduction.key = "peakunionUMAP_")
+
+DefaultAssay(aggregated_Epicardial) <- "SCT"
+aggregated_Epicardial <- FindMultiModalNeighbors(
+  object = aggregated_Epicardial,
+  reduction.list = list("harmony_pca", "harmony_lsi"), 
+  dims.list = list(1:30, 2:10),# Determinded to be optimal amount of dims through visualization
+  modality.weight.name = c("SCT.weight","peakunion.weight"),
+  verbose = TRUE, k.nn = 5,knn.range = 5
+)
+aggregated_Epicardial <- RunUMAP(
+  object = aggregated_Epicardial,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNN_UMAP_",
+  verbose = TRUE,
+)
+aggregated_Epicardial$Cell_state <- "Epi"
+
+saveRDS(aggregated_Epicardial,"Epicardial.rds")
+
+quick_CT_plot(aggregated_Epicardial, 2,"WNN_umap",legend = F,label = T,font.size = 8)
+quick_cond_plot(aggregated_Epicardial, 2,"WNN_umap",legend = F)
+
+```
+## Schwann Cells
+```{r echo=TRUE}
+
+#Subset Schwann population (Population so small and homogeneous its not worth assessing contamination)
+
+aggregated_Schwann <- subset(aggregated_samples, idents = "Schwann Cells") 
+
+### Too few cells for normalization and PCA and RNA umap analysis
+#aggregated_Schwann <- SCTransform(aggregated_Schwann, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000) 
+
+DefaultAssay(aggregated_Schwann) <- "SCT"
+
+DefaultAssay(aggregated_Schwann) <- "peakunion"
+aggregated_Schwann <- FindTopFeatures(aggregated_Schwann, min.cutoff = 10)
+aggregated_Schwann<- RunTFIDF(aggregated_Schwann)
+aggregated_Schwann <- RunSVD(aggregated_Schwann)
+
+
+DefaultAssay(aggregated_Schwann) <- "SCT"
+aggregated_Schwann <- FindMultiModalNeighbors(
+  object = aggregated_Schwann,
+  reduction.list = list("harmony_pca", "lsi"), 
+  dims.list = list(1:30, 2:10),# Determinded to be optimal amount of dims through visualization
+  modality.weight.name = c("SCT.weight","peakunion.weight"),
+  verbose = TRUE, k.nn = 5,knn.range = 5
+)
+aggregated_Schwann <- RunUMAP(
+  object = aggregated_Schwann,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNN_UMAP_",
+  verbose = TRUE,
+)
+
+aggregated_Schwann$Cell_state <- "Schwann"
+
+saveRDS(aggregated_Schwann,"Schwann.rds")
+
+```
+

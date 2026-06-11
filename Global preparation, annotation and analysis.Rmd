@@ -1,0 +1,585 @@
+---
+title: "SDH inhibition snMultiome RNA & ATAC-seq"
+author: "Dakota Nuttall"
+date: "2025-06-17"
+R-version: 4.3.3
+---
+###Global Preparation and Annotation###
+
+```{r include=FALSE}
+set.seed(1234)
+library(Seurat)
+library(SeuratObject)
+library(Signac)
+library(harmony)
+library(dplyr)
+library(reticulate)
+library(hdf5r)
+library(scales)
+library(ggplot2)
+library(EnhancedVolcano)
+library(openxlsx)
+library(readxl)
+library(writexl)
+library(GenomeInfoDb)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(org.Mm.eg.db)
+library(JASPAR2024)
+library(TFBSTools)
+library(DropletUtils)
+library(Gviz)
+library(ggpubr)
+library(stringr)
+library(VariantAnnotation)
+library(purrr)
+library(tidyr)
+
+```
+####  Load data  ####
+
+```{r echo=TRUE}
+#Load integrated file
+aggregated_samples <- readRDS("aggregated_Integrated.rds")
+
+#optional to reduce file size
+aggregated_samples@assays$ATAC <- NULL
+
+# Re-normalize and perform Harmony batch correction
+aggregated_samples$orig.ident <- factor(x = aggregated_samples$orig.ident, levels = c("Saline_Sham","Malonate_Sham","Saline_MI","Malonate_MI"))
+
+DefaultAssay(aggregated_samples) <- "RNA"
+
+aggregated_samples <- SCTransform(aggregated_samples, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+DefaultAssay(aggregated_samples) <- "SCT"
+aggregated_samples <- RunPCA(aggregated_samples, npcs = 50)
+aggregated_samples <- IntegrateLayers(object = aggregated_samples, method = HarmonyIntegration, new.reduction = "harmony_pca", orig.reduction = "pca",assay = "SCT")
+VariableFeatures(aggregated_samples) <- rownames(aggregated_samples@assays[["SCT"]]@scale.data)[!grepl(pattern="^mt-|^Rps|^Rpl|^Mrpl|^Mrps",rownames(aggregated_samples@assays[["SCT"]]@scale.data))]
+
+aggregated_samples <- RunUMAP(aggregated_samples, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+
+```
+
+##Perform doublet prediction using Scrublet
+
+```{r echo=TRUE}
+##Scrublet
+#Join the individual RNA counts into one layer
+DefaultAssay(aggregated_samples) <- "RNA"
+aggregated_samples <- JoinLayers(aggregated_samples)
+
+## Get RNA matrix for scrublets
+
+conditions <- c("Saline_Sham","Malonate_Sham","Saline_MI","Malonate_MI")
+Scrublet_merged(aggregated_samples,conditions = conditions)#see Helper Functions
+
+#Find Recovered cells for determining expected doublet rates (calculated using 10x v3.1 user guide, approximately 0.8% per 1k cells recovered from Cell Ranger's "estimated cell" in the web summary for each sample)
+
+Cell_ranger_estimated_cells <- c(2934,5842,4341,4958) # by condition order
+Scrublet_estimates <- data.frame(condition = conditions, estimated_cells = Cell_ranger_estimated_cells,multiplet_rate = round((Cell_ranger_estimated_cells/1000 *.008), 3))
+Scrublet_estimates
+
+##Proceed to scrublet.ipynb script
+  
+```
+##Filter doublets
+
+```{r echo=TRUE}
+## Combine scrublet metadata with Seurat object
+salSham_scrublet <- read.csv("Saline_Sham_counts_scrublet_output_table.csv")# Doublet Threshold 0.13
+malSham_scrublet <- read.csv("Malonate_Sham_counts_scrublet_output_table.csv")# Doublet Threshold 0.14
+salMI_scrublet <- read.csv("Saline_MI_counts_scrublet_output_table.csv")# Doublet Threshold 0.15
+malMI_scrublet <- read.csv("Malonate_MI_counts_scrublet_output_table.csv") # Doublet Threshold 0.15
+scrub_meta <- salSham_scrublet
+scrub_meta <- bind_rows(scrub_meta,y = malSham_scrublet)
+scrub_meta <- bind_rows(scrub_meta,y = salMI_scrublet)
+scrub_meta <- bind_rows(scrub_meta,y = malMI_scrublet)
+aggregated_samples <- AddMetaData(aggregated_samples, scrub_meta)
+
+doublets_BCs <- Cells(subset(aggregated_samples,predicted_doublet=="True" ))
+writeLines(doublets_BCs, "doublets_BCs.txt") # for prefiltered meta data
+
+
+Percent_doublet <- length(doublets_BCs)/length(aggregated_samples$predicted_doublet)
+doublet_labels <-  c()
+
+aggregated_samples$doublet <- FALSE
+
+cells <- c(1:length(colnames(aggregated_samples)))
+
+for (c in cells){
+  if (colnames(aggregated_samples)[c] %in% doublets_BCs){
+    aggregated_samples$doublet[c] <- TRUE
+  }
+}
+#Check
+length(doublets_BCs) == sum(aggregated_samples$doublet)
+
+#Visualize proportion doublets
+pt <- table(aggregated_samples$doublet, aggregated_samples$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var2 <- as.character(pt$Var2)
+pt$Var2<- factor(pt$Var2, levels=c("Saline_Sham","Malonate_Sham","Saline_MI","Malonate_MI"))
+p2 <- ggplot(pt, aes(x = Var2, y = Freq, fill = Var1 )) +
+  theme_bw(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Condition") +
+  ylab("Proportion") +
+  theme(legend.title = element_blank(),axis.text=element_text(size=16),legend.text  = element_text( size = 14),axis.title=element_text(size=18)) +
+  scale_fill_manual(values = c("skyblue","black"),labels = c("Singlet", "Doublet"))+ theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p2
+ggsave("aggregated_samples_prop.tif", height = 5,width = 6)
+DimPlot(aggregated_samples, pt.size = .1, reduction = "umap_RNA", group.by = 'doublet', cols = c("skyblue","black"))+ labs(title = paste("Filtered Nuclei (",round(Percent_doublet*100,digits = 2),"%)", sep = ""))+
+  theme(legend.text  = element_text( size = 14), axis.text=element_blank(),axis.ticks=element_blank(), axis.line = element_line(linewidth =  1))+ xlab("UMAP 1") + ylab("UMAP 2") 
+ggsave("aggregated_filtered_doublets_umap.tif", height = 5,width = 5)
+
+##Remove doublets and re-normalize 
+aggregated_samples <- subset(aggregated_samples, doublet == FALSE)
+aggregated_samples[["RNA"]] <- split(aggregated_samples[["RNA"]], f = aggregated_samples$orig.ident)
+aggregated_samples <- SCTransform(aggregated_samples,vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+  
+```
+##Perform cluster level level QC to remove low quality clusters
+
+```{r echo=TRUE}
+#Redo UMAP after subsetting  
+DefaultAssay(aggregated_samples) <- "SCT"
+
+aggregated_samples <- RunPCA(aggregated_samples, npcs = 50)
+aggregated_samples <- RunHarmony(aggregated_samples, 
+                              group.by.vars = "orig.ident",
+                              reduction = "pca", assay.use = "SCT", reduction.save = "harmony_pca",project.dim= F)
+aggregated_samples <- FindNeighbors(object = aggregated_samples, dims = 1:50, reduction = "harmony_pca")
+
+aggregated_samples <- RunUMAP(aggregated_samples, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+## Visualize each plot and pick the resolution that works best; We chose 3
+aggregated_samples <- FindClusters(object = aggregated_samples, resolution = seq(1, 4, 0.5))
+
+Idents(aggregated_samples) <- aggregated_samples$SCT_snn_res.4
+
+DimPlot(aggregated_samples, reduction = "umap_RNA", label = 'true')
+DimPlot(aggregated_samples, pt.size = .8, reduction = "umap_RNA", group.by = 'orig.ident')
+
+#Identify and remove low RNA count clusters
+VlnPlot(object = aggregated_samples, features = c( "nCount_RNA"), ncol = 1, pt.size = 0) + NoLegend()
+ggsave("QC_nCount_RNA_vln.tif", height = 5,width = 8)
+
+
+lowRNA <- identify_low_RNA_clusters(aggregated_samples) #see Helper Functions
+low_quality <- Cells(subset(aggregated_samples, idents = lowRNA))
+
+#Identify potentially contaminated clusters that display abnormal gene marker profile, which indicates contamination 
+annotation_markers <- c("Myh6","Ttn","Tnnt2","Ryr2", #Cardiomyocytes
+                        "Col1a1","Postn","Pdgfra","Gsn","Htra3",#Cardiac Fibroblasts
+                        "Cdh5","Fabp4","Pecam1","Kdr",#Endothelial Cells
+                        "Rgs5","Kcnj8","P2ry14","Pdgfrb","Vtn",#Mural cells
+                        "Ccr2","Cx3cr1","Mrc1","Cd68","C1qa","Ms4a7",#Myeloid Cells
+                        "Cd79a","Ikzf3","Ms4a1","Skap1",#Lymphoid Cells
+                        "Upk3b","Upk1b","Clu","Dmkn",# Epicardial cells
+                        "Kcna1","Kcna2","Cdh19","Plp1",#Schwann cells
+                        "mt-Co1","mt-Atp6","mt-Nd1"#Mito RNA (for QC and identifying contaminated clusters)
+                        )
+
+DotPlot_SCT(subset(aggregated_samples, idents = lowRNA, invert = T), gene_vector = annotation_markers)
+ggsave("QC_dotplot.tif", height = 8,width = 8)
+
+#Define contaminated populations based on dotplot
+contaminated <- "40" # Expressed markers for CMs, CFs, ECs, Epis, as well as having higher mitochondrial percentage than the other clusters, likely just a contaiminated population
+low_quality <-c(low_quality,Cells(subset(aggregated_samples, idents = contaminated)))
+writeLines(low_quality, "low_quality_BCs.txt") # for prefiltered meta data
+
+Percent_lowquality <- length(low_quality)/length(aggregated_samples@active.ident)
+
+aggregated_samples <- subset(aggregated_samples, cells = low_quality, invert =  T)
+
+DefaultAssay(aggregated_samples) <- "RNA"
+aggregated_samples <- SCTransform(aggregated_samples,vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+DefaultAssay(aggregated_samples) <- "SCT"
+
+```
+##Define cell types
+```{r echo=TRUE}
+
+ElbowPlot(aggregated_samples, ndims = 50, reduction = "pca")
+aggregated_samples <- FindNeighbors(object = aggregated_samples,reduction = "harmony_pca", dims = 1:50)
+
+aggregated_samples <- RunUMAP(aggregated_samples, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+aggregated_samples <- FindClusters(object = aggregated_samples, resolution = seq(.1, 1, 0.1), algorithm = 3 )
+
+## Visualize each plot and pick the resolution that works best; We chose 0.3 as it was needed to visualize Schwann cells
+DimPlot(aggregated_samples, reduction = "umap_RNA", label = 'true',group.by = "SCT_snn_res.0.3")
+DimPlot(aggregated_samples, pt.size = .8, reduction = "umap_RNA", group.by = 'orig.ident')
+
+aggregated_samples@active.ident <- aggregated_samples$SCT_snn_res.0.3
+DefaultAssay(aggregated_samples) <- "SCT"
+
+#Use marker genes below to plot and annotate cell types
+annotation_markers <- c("Myh6","Ttn","Tnnt2","Ryr2", #Cardiomyocytes
+                        "Col1a1","Postn","Pdgfra","Gsn","Htra3",#Cardiac Fibroblasts
+                        "Cdh5","Fabp4","Pecam1","Kdr",#Endothelial Cells
+                        "Rgs5","Kcnj8","P2ry14","Pdgfrb","Vtn",#Mural cells
+                        "Mrc1","Cd68","C1qa","Ms4a7","Ccr2","Cx3cr1",#Myeloid Cells
+                        "Cd79a","Ikzf3","Ms4a1","Skap1",#Lymphoid Cells
+                        "Upk3b","Upk1b","Clu","Dmkn",# Epicardial cells
+                        "Kcna1","Kcna2","Cdh19","Plp1")#Schwann cells
+
+DotPlot_SCT(aggregated_samples, gene_vector = annotation_markers)
+
+cell_types <- c("CF","EC","Mural","CM","Myeloid","EC","EC","EC","Epi","EC","Lymph","CF","EC","Mural","Schwann")
+
+aggregated_samples@active.ident<-factor(aggregated_samples@active.ident, labels = cell_types)
+
+#Use this to figure out current order of clusters
+table(aggregated_samples@active.ident)
+
+#Reorder levels
+cell_levels <- c("CM","CF","EC","Mural","Myeloid","Lymph","Epi","Schwann")
+aggregated_samples@active.ident<-factor(aggregated_samples@active.ident, levels  = cell_levels)
+
+DotPlot_SCT(aggregated_samples, gene_vector = annotation_markers,pt.size = 20)
+ggsave("Global_dotplot.tiff", height = 8,width = 7)
+
+cell_types <- c("Cardiomyocytes","Cardiac Fibroblasts","Endothelial Cells","Mural Cells","Myeloid Cells","Lymphoid Cells","Epicardial Cells","Schwann Cells")
+
+aggregated_samples@active.ident<-factor(aggregated_samples@active.ident, labels = cell_types, )
+
+aggregated_samples$Cell_type <- Idents(aggregated_samples)
+
+DimPlot(aggregated_samples, reduction = "umap_RNA", label = 'true', repel = T)+ theme(legend.position="bottom") + NoLegend()
+DimPlot(aggregated_samples, pt.size = .8, reduction = "umap_RNA", group.by = 'orig.ident',)+ theme(legend.position="bottom") + labs(title = NULL)
+
+```
+##Normalize ATAC data and perform multimodal weighted nearest neaighbor analysis
+```{r echo=TRUE}
+#NormalizeATAC data
+DefaultAssay(aggregated_samples) <- "peakunion"
+aggregated_samples <- FindTopFeatures(aggregated_samples, min.cutoff = 10)
+aggregated_samples<- RunTFIDF(aggregated_samples)
+aggregated_samples <- RunSVD(aggregated_samples )
+ElbowPlot(aggregated_samples, ndims = 50, reduction = "lsi")
+
+#Check that TSS.Enrichment is > 1 and Nucleosome signal < 2, if not filter
+if(length(Cells(aggregated_samples)) == length(Cells(subset(aggregated_samples, subset = nucleosome_signal < 2 &
+                   TSS.enrichment > 1 )))){print("No additional filtering needed")}else{aggregated_samples<- subset(aggregated_samples, subset = nucleosome_signal < 2 &
+                   TSS.enrichment > 1 )}# No additional filtering needed in this case
+
+
+#Perform Harmony on ATAC data
+aggregated_samples <- RunHarmony(aggregated_samples, 
+                              group.by.vars = "orig.ident",
+                              reduction = "lsi", assay.use = "peakunion", reduction.save = "harmony_lsi",project.dim= F)
+aggregated_samples <- RunUMAP(object = aggregated_samples, reduction = 'harmony_lsi', dims = 2:50, reduction.name = "umap_ATAC", reduction.key = "ATACUMAP")
+
+DimPlot(aggregated_samples, reduction = "umap_ATAC", label = 'true') 
+DimPlot(aggregated_samples,reduction = "umap_ATAC", group.by = "orig.ident")
+
+# build a WNN neighbor graph using both assays
+DefaultAssay(aggregated_samples) <- "SCT"
+aggregated_samples <- FindMultiModalNeighbors(
+  object = aggregated_samples,
+  reduction.list = list("harmony_pca", "harmony_lsi"), 
+  dims.list = list(1:50, 2:50),
+  modality.weight.name = c("SCT.weight","ATAC.weight"),
+  verbose = TRUE
+)
+
+# build a WNN UMAP visualization
+aggregated_samples <- RunUMAP(
+  object = aggregated_samples,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNNUMAP",
+  verbose = TRUE
+)
+
+##Visualize
+clust_colors <- c("darkorange2","mediumorchid2","steelblue3","olivedrab","indianred1","hotpink","darkred","green3","cyan")
+treatment_colors <-c("lightskyblue","pink", "steelblue4","red3")
+
+quick_CT_plot(object = aggregated_samples,pt.size = .1,reduction = "WNN_umap", legend = F, label = T, font.size = 9)
+quick_cond_plot(object = aggregated_samples,pt.size = .1,reduction = "WNN_umap", legend = F)
+
+#Save progress for subclsuter analysis
+Idents(object = aggregated_samples) <- aggregated_samples$Cell_type
+saveRDS(aggregated_samples,"aggregated_global.rds")
+```
+#####Proceed to analysis of subclusters then return to this spot####
+```{r echo=TRUE}
+###After processing subclusters
+
+aggregated_merged <- merge(x = aggregated_Cardiomyocytes, y=list(aggregated_Cardiac_Fibroblasts,aggregated_Endothelial_Cells,aggregated_Mural,aggregated_Myeloid,aggregated_Lymphoid,aggregated_Epicardial,aggregated_Schwann))
+
+aggregated_samples <- readRDS("aggregated_global.rds")
+
+low_quality <- readLines("low_quality_BCs+CM+CFv2+EC+Mur+Lymph.txt")
+
+aggregated_merged <-  subset(aggregated_samples, cells = low_quality, invert =  T)
+
+subset_list <- list(aggregated_Cardiomyocytes,aggregated_Cardiac_Fibroblasts,aggregated_Endothelial_Cells,aggregated_Mural,aggregated_Myeloid,aggregated_Lymphoid,aggregated_Epicardial,aggregated_Schwann)
+
+# Initialize column in original object (optional but recommended)
+aggregated_merged$Cell_state <- NA
+
+# Loop through subset objects
+for (i in seq_along(subset_list)) {
+
+  sub_obj <- subset_list[[i]]
+  print(i)
+  # Extract metadata
+  cell_states <- sub_obj@meta.data$Cell_state
+  names(cell_states) <- colnames(sub_obj)
+  
+  # Add back to original object
+  aggregated_merged$Cell_state[names(cell_states)] <- as.character(cell_states)
+}
+
+Idents(aggregated_merged) <- aggregated_merged$Cell_type
+
+aggregated_merged$orig.ident <- factor(aggregated_merged$orig.ident, levels = c("Saline_Sham","Malonate_Sham","Saline_MI","Malonate_MI"))
+
+aggregated_merged <- SCTransform(aggregated_merged,vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+
+DefaultAssay(aggregated_merged) <- "SCT"
+
+aggregated_merged <- RunPCA(aggregated_merged, npcs = 50)
+aggregated_merged <- RunHarmony(aggregated_merged, 
+                              group.by.vars = "orig.ident",
+                              reduction = "pca", assay.use = "SCT", reduction.save = "harmony_pca",project.dim= F)
+aggregated_merged <- FindNeighbors(object = aggregated_merged, dims = 1:50, reduction = "harmony_pca")
+
+aggregated_merged <- RunUMAP(aggregated_merged, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+#NormalizeATAC data
+DefaultAssay(aggregated_merged) <- "peakunion"
+aggregated_merged <- FindTopFeatures(aggregated_merged, min.cutoff = 10)
+aggregated_merged<- RunTFIDF(aggregated_merged)
+aggregated_merged <- RunSVD(aggregated_merged )
+ElbowPlot(aggregated_merged, ndims = 50, reduction = "lsi")
+
+#Perform Harmony on ATAC data
+aggregated_merged <- RunHarmony(aggregated_merged, 
+                              group.by.vars = "orig.ident",
+                              reduction = "lsi", assay.use = "peakunion", reduction.save = "harmony_lsi",project.dim= F)
+aggregated_merged <- RunUMAP(object = aggregated_merged, reduction = 'harmony_lsi', dims = 2:50, reduction.name = "umap_ATAC", reduction.key = "ATACUMAP")
+
+DimPlot(aggregated_merged, reduction = "umap_ATAC", label = 'true') 
+DimPlot(aggregated_merged,reduction = "umap_ATAC", group.by = "orig.ident")
+
+# build a WNN neighbor graph using both assays
+DefaultAssay(aggregated_merged) <- "SCT"
+aggregated_merged <- FindMultiModalNeighbors(
+  object = aggregated_merged,
+  reduction.list = list("harmony_pca", "harmony_lsi"), 
+  dims.list = list(1:50, 2:50),
+  modality.weight.name = c("SCT.weight","ATAC.weight"),
+  verbose = TRUE
+)
+
+# build a WNN UMAP visualization
+aggregated_merged <- RunUMAP(
+  object = aggregated_merged,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNNUMAP",
+  verbose = TRUE
+)
+
+aggregated_merged$barcodes <- colnames(aggregated_merged)
+
+saveRDS(aggregated_merged,"aggregated_global_merged.rds")
+aggregated_merged <- readRDS("aggregated_global_merged.rds")
+
+#Print final plots, functions below found in helper functions script
+quick_CT_plot(object = aggregated_merged,pt.size = .1,reduction = "umap_RNA", legend = F, label = F, font.size = 9)
+ggsave("Global_umap_RNA_only_sub.tif", height = 7,width = 7)
+quick_CT_plot(object = aggregated_merged,pt.size = .1,reduction = "umap_ATAC", legend = F, label = F, font.size = 9)
+ggsave("Global_umap_ATAC_only_sub.tif", height = 7,width = 7)
+quick_CT_plot(object = aggregated_merged,pt.size = .1,reduction = "WNN_umap", legend = F, label = T, font.size = 8)
+ggsave("Global_umap_sub.tif", height = 7,width = 7)
+quick_cond_plot(object = aggregated_merged,pt.size = .1,reduction = "WNN_umap", legend = F)
+ggsave("Global_umap_cond.tif", height = 7,width = 7)
+
+#Perform differential gene expression analysis comparing one cluster to all clusters simultaneously to find unique DEGs.
+aggregated_merged <- PrepSCTFindMarkers(aggregated_merged, assay = "SCT",verbose = T)
+DefaultAssay(aggregated_merged) <- "SCT"
+Global_CT_markers <- FindAllMarkers(aggregated_merged, only.pos = T, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT" ,return.thresh = 1)
+Global_CT_markers$gene <- sub("\\..*", "", rownames(Global_CT_markers))
+Global_CT_markers <- Global_CT_markers %>% group_by(cluster) %>% mutate(BH_p_val_adj = p.adjust(p_val, method = "BH")) 
+Global_CT_markers <- Global_CT_markers[!grepl("mt-",Global_CT_markers$gene),]#Mitochondrial RNA is typically removed during nuclear exraction but some can be bound to ER during extraction so it is removed 
+Global_CT_markers <- as.data.frame(Global_CT_markers)
+Global_CT_markers_sig <- subset(Global_CT_markers, BH_p_val_adj < 0.05)
+colnames(Global_CT_markers_sig)[6] <- "Cell type"
+
+
+
+```
+Plot global ATAC data
+```{r echo=TRUE}
+
+#Plotbased on treatment condition
+
+Idents(object = aggregated_merged) <- aggregated_merged$orig.ident
+
+conditions <- c("Saline_Sham","Malonate_Sham","Saline_MI","Malonate_MI")
+prefix <- c("salSham","malSham","salMI","malMI")
+index <- c(1:length(conditions))
+
+for (i in index){
+DimPlot(aggregated_merged,reduction = 'WNN_umap', group.by = "orig.ident", pt.size = .1, cells.highlight = WhichCells(aggregated_merged,idents = conditions[i]),cols.highlight = c(treatment_colors[i]))+# Change treatment color[1-4] for each condition type
+ theme(legend.position="bottom",axis.text=element_blank(),axis.ticks=element_blank(), axis.line = element_line(linewidth =  1),axis.title=element_text(size=16)) + labs(title = NULL)+
+  theme(legend.text  = element_text( size = 14)) + xlab("UMAP 1") + ylab("UMAP 2")+ NoLegend()
+ggsave(paste(prefix[i],"_umap_cond.tif",sep = ""), height = 5,width = 5)
+}
+
+DefaultAssay(aggregated_merged) <- "peakunion"
+Idents(object = aggregated_merged) <- aggregated_merged$Cell_type
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+annotation <- renameSeqlevels(annotation, mapSeqlevels(seqlevels(annotation), "UCSC"))
+
+Annotation(aggregated_merged)<- annotation
+## Demonstrate differences in gene accessibility between cell types
+#P3-Fabp4: chr3-10208000-10208500
+#P2-Pdgfra: chr5-75151500-75153000
+#P1-Myh6: chr14-54966000-54967500
+#P4-Rgs5: chr1-169655000-169655100
+#P5- Mrc1 chr2-14228000-14229000
+#p6 -Ikzf3: chr11-98544500-98545500
+#p7-Upk3b: chr5-136038000-136039000
+#p8 -  Cdh19: chr1-110975000-110978000
+anno_peaks <- c("chr14-54966000-54967500","chr5-75151500-75153000","chr3-10208000-10208500","chr1-169655000-169655100","chr2-14228000-14229000","chr11-98544500-98545500","chr5-136038000-136039000","chr1-110975000-110978000")
+anno_peaks_cov <- list()
+i <-1
+for (peak in anno_peaks){
+ p<-CoveragePlot(
+  object = aggregated_merged,
+  region = peak,
+  features = NULL,
+  expression.assay = "SCT",
+  assay = "peakunion",
+  links = F,
+  peaks = F, extend.upstream = 0, extend.downstream = 1000
+  
+)
+
+p <- p & scale_fill_manual(values =  clust_colors) & theme(legend.text  = element_blank(),axis.title.y=element_blank(), axis.text.y=element_blank(),axis.ticks.y=element_blank(),strip.text.y.left = element_blank(),strip.background = element_blank(),axis.text.x.top  = element_text(size=8)) 
+  anno_peaks_cov[[i]] <- p
+  i <- i + 1
+}
+
+combined_p <- ggarrange(anno_peaks_cov[[1]],anno_peaks_cov[[2]],anno_peaks_cov[[3]],anno_peaks_cov[[4]],anno_peaks_cov[[5]],anno_peaks_cov[[6]],anno_peaks_cov[[7]],anno_peaks_cov[[8]], ncol = 8)
+combined_p
+ggsave("global_peaks.tif", combined_p, width = 20, height = 5)
+
+#To identify ATAC peaks near genes concordant with RNA data 
+
+library(ChIPseeker)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+
+annotated_peaks <- annotatePeak(
+  peak = granges(aggregated_merged[["peakunion"]]),
+  TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene,
+  tssRegion = c(-2000, 2000),
+  annoDb = "org.Mm.eg.db"
+)
+
+annotated_peaks_df <- as.data.frame(annotated_peaks)
+
+# Add peak column to markers dataframe
+annotated_peaks_df$peak <- gsub(
+  ":|-",
+  "-",
+  paste0(
+    annotated_peaks_df$seqnames,
+    "-",
+    annotated_peaks_df$start,
+    "-",
+    annotated_peaks_df$end
+  )
+)
+
+
+Global_peak_markers <- FindAllMarkers(aggregated_merged,only.pos = T, min.pct = 0.05, logfc.threshold = .25, test.use = "wilcox", recorrect_umi = T, assay = "peakunion")
+    Global_peak_markers$BH_p_val_adj <- p.adjust(Global_peak_markers$p_val, method='BH')
+    Global_peak_markers$peak <- rownames(Global_peak_markers)
+    Global_peak_markers <- subset(Global_peak_markers, BH_p_val_adj < 0.05)
+    Global_peak_markers <- left_join(Global_peak_markers,annotated_peaks_df[, c("peak", "annotation", "SYMBOL")],by = "peak")
+    colnames(Global_peak_markers)[6] <- "Cell type"
+    
+Global_list <- list("Global RNA" = Global_CT_markers_sig, "Global ATAC" = Global_peak_markers)
+
+write_xlsx(Global_list, "Supplemental table 1 (global markers).xlsx")
+
+
+
+```
+Combine differntial analysis results for RNA and ATAC data between cell types
+```{r echo=TRUE}
+
+##RNA Condition level
+Cond_CM <- read.xlsx("CM_Sal_vs_Mal_sig.xlsx")
+Cond_CF <- read.xlsx("CF_Sal_vs_Mal_sig.xlsx")
+Cond_EC <- read.xlsx("EC_Sal_vs_Mal_sig.xlsx")
+Cond_Mural <- read.xlsx("Mural_Sal_vs_Mal_sig.xlsx")
+Cond_Mye <- read.xlsx("Mye_Sal_vs_Mal_sig.xlsx")
+
+Cond_list <- list("CM" = Cond_CM,"CF" = Cond_CF, "EC" = Cond_EC,  "Mural" = Cond_Mural,"Myeloid" = Cond_Mye)
+
+# Write the entire list to an Excel file
+write_xlsx(Cond_list, "Supplemental table 2 (Condition).xlsx")#Note BH p values removed and columns reordered in Excel
+
+##RNA subcluster level
+cluster_CM_all <- read.xlsx("CM_all_DEGs_sig.xlsx")
+cluster_CM_compare <- read.xlsx("CM_CT_compare_DEGs.xlsx")
+cluster_CF_all <- read.xlsx("CF_all_DEGs_sig.xlsx")
+cluster_CF_compare <- read.xlsx("CF_CT_compare_DEGs.xlsx")
+cluster_EC_all <- read.xlsx("EC_all_DEGs_sig.xlsx")
+cluster_Mural_all <- read.xlsx("Mur_all_DEGs_sig.xlsx")
+cluster_Mye_all <- read.xlsx("Mye_all_DEGs_sig.xlsx")
+
+cluster_list <- list("CM all" = cluster_CM_all, "CM comparisons" = cluster_CM_compare,"CF all" = cluster_CF_all, "CF comparisons" = cluster_CF_compare, "EC all" = cluster_EC_all,  "Mural all" = cluster_Mural_all,"Myeloid all" = cluster_Mye_all)
+
+# Write the entire list to an Excel file
+write_xlsx(cluster_list, "Supplemental table 5 (Subcluster).xlsx")#Note BH p values removed and columns reordered in Excel
+
+##ATAC peaks (linear regression cell/cluster level, comparisons only)
+Peaks_CM <- read.xlsx("CM_CT_compare_peaks.xlsx")
+Peaks_CF <- read.xlsx("CF_CT_compare_peaks.xlsx")
+
+
+Peaks_list <- list("CM" = Peaks_CM,"CF" = Peaks_CF)
+
+# Write the entire list to an Excel file
+write_xlsx(Peaks_list, "Supplemental table 6 (Peaks).xlsx")#Note BH p values removed and columns reordered in Excel
+
+```
+###Plot filtered cells (low RNA and contaminated)
+```{r echo=TRUE}
+
+aggregated_samples <- readRDS("aggregated_Integrated.rds")
+doublets_BCs <- readLines("doublets_BCs.txt")
+aggregated_samples <- subset(aggregated_samples,cells = doublets_BCs, invert = T )
+aggregated_samples <- SCTransform(aggregated_samples,vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+#Redo UMAP after subsetting  
+DefaultAssay(aggregated_samples) <- "SCT"
+
+aggregated_samples <- RunPCA(aggregated_samples, npcs = 50)
+aggregated_samples <- RunHarmony(aggregated_samples, 
+                              group.by.vars = "orig.ident",
+                              reduction = "pca", assay.use = "SCT", reduction.save = "harmony_pca",project.dim= F)
+aggregated_samples <- FindNeighbors(object = aggregated_samples, dims = 1:50, reduction = "harmony_pca")
+
+aggregated_samples <- RunUMAP(aggregated_samples, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+low_quality <- readLines("low_quality_BCs+CM+CFv2+EC+Mur+Lymph.txt")# Last version
+Percent_lowquality <- length(low_quality)/length(aggregated_samples@active.ident)
+
+DimPlot(aggregated_samples,reduction = 'umap_RNA', pt.size = .1, cells.highlight = low_quality,cols.highlight = "black",sizes.highlight = .1)+ theme(legend.position="bottom",axis.text=element_blank(),axis.ticks=element_blank(), axis.line = element_line(linewidth =  1),axis.title=element_text(size=16)) + labs(title = paste("Filtered Nuclei (",round(Percent_lowquality*100,digits = 2),"%)", sep = "") )+
+  theme(legend.text  = element_text(size = 14)) + xlab("UMAP 1") + ylab("UMAP 2")+
+  scale_color_manual(labels = c("High-quality", "Low-quality"), values = c("grey", "black"))
+ggsave("Low_quality_umap.tif", height = 5,width = 5)
+```

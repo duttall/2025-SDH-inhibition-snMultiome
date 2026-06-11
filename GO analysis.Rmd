@@ -1,0 +1,453 @@
+---
+title: "SDH inhibition snMultiome RNA & ATAC-seq"
+author: "Dakota Nuttall"
+date: "2025-06-17"
+R-version: 4.3.3
+
+---
+
+###GO Analysis###
+```{r echo=TRUE}
+set.seed(1234)
+library(clusterProfiler)
+library(dplyr)
+library(readxl)
+library(ggplot2)
+library(openxlsx)
+library(writexl)
+library(stringr)
+```
+####  Load data  ####
+
+```{r echo=TRUE}
+###GO Analaysis (repeat for each dataset)
+GOcluster<- read.xlsx("CM_all_DEGs_sig.xlsx")# repeat for each com
+
+
+GOfile <- GOcluster[GOcluster$cluster=="CM1",] # GOcluster$comparison for MAST and GOcluster$cluster for MAST
+
+#GOfile <- subsetMP3vMP4.markers
+
+#upregulated genes
+GOfile<- subset(GOfile, avg_log2FC > .25)# for fold change of 1.2
+GO_genes <- GOfile$gene
+##OR##
+#downregulated genes
+GOfile<- subset(GOfile, avg_log2FC < -.25)
+
+GO_genes <- GOfile$gene
+
+
+```
+#Perform GO analysis
+```{r echo=TRUE}
+CT_GO<- enrichGO(gene = GO_genes,OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP",pAdjustMethod = "BH")
+CT_GO.df <- as.data.frame(CT_GO)
+CT_GO.df$log10p.adjusted <- -log10(CT_GO.df$p.adjust)
+CT_GO.df$labels <- paste(CT_GO.df$Description,CT_GO.df$ID)
+
+# Create a new column for the wrapped labels
+CT_GO.df$labels_wrapped <- NA
+
+# Apply the custom function to each row using a for loop
+for (i in 1:nrow(CT_GO.df)) {
+  CT_GO.df$labels_wrapped[i] <- split_into_two_lines(CT_GO.df$labels[i])
+}
+
+write.xlsx(CT_GO.df,"CM1_GO_downregulated.xlsx") #repeat for downregulated and other subculsters
+
+```
+##Identify key and unique Go Terms )
+```{r echo=TRUE}
+#Load each GO dataset and identify terms that are unique to each cluster/treatment (Note: Both unique and shared terms were used for final analysis, degree of upregulation and which genes contributed to the terms was also taken into account)
+
+CT_GO.df_CM1 <- read.xlsx("CM1_GO_upregulated.xlsx")
+CT_GO.df_CM1$cluster <- "CM1"
+CT_GO.df_CM2 <- read.xlsx("CM2_GO_upregulated.xlsx")
+CT_GO.df_CM2$cluster <- "CM2"
+CT_GO.df_CM3 <- read.xlsx("CM3_GO_upregulated.xlsx")
+CT_GO.df_CM3$cluster <- "CM3"
+
+CT_GO.df_CM1_filtered <- dplyr::filter(CT_GO.df_CM1, !Description %in% CT_GO.df_CM2$Description & !Description %in% CT_GO.df_CM3$Description)
+CT_GO.df_CM2_filtered <- dplyr::filter(CT_GO.df_CM2, !Description %in% CT_GO.df_CM1$Description & !Description %in% CT_GO.df_CM3$Description)
+CT_GO.df_CM3_filtered <- dplyr::filter(CT_GO.df_CM3, !Description %in% CT_GO.df_CM1$Description & !Description %in% CT_GO.df_CM2$Description)
+
+CT_GO.df_CM1_down <- read.xlsx("CM1_GO_downregulated.xlsx")
+CT_GO.df_CM1_down$cluster <- "CM1"
+CT_GO.df_CM2_down <- read.xlsx("CM2_GO_downregulated.xlsx")
+CT_GO.df_CM2_down$cluster <- "CM2"
+CT_GO.df_CM3_down <- read.xlsx("CM3_GO_downregulated.xlsx")
+CT_GO.df_CM3_down$cluster <- "CM3"
+
+CT_GO.df_CM1_filtered_down <- dplyr::filter(CT_GO.df_CM1_down, !Description %in% CT_GO.df_CM2_down$Description & !Description %in% CT_GO.df_CM3_down$Description)
+CT_GO.df_CM2_filtered_down <- dplyr::filter(CT_GO.df_CM2_down, !Description %in% CT_GO.df_CM1_down$Description & !Description %in% CT_GO.df_CM3_down$Description)
+CT_GO.df_CM3_filtered_down <- dplyr::filter(CT_GO.df_CM3_down, !Description %in% CT_GO.df_CM1_down$Description & !Description %in% CT_GO.df_CM2_down$Description)
+
+CT_GO.df_CF1 <- read.xlsx("CF1_GO_upregulated.xlsx")
+CT_GO.df_CF1$cluster <- "CF1"
+CT_GO.df_CF2 <- read.xlsx("CF2_GO_upregulated.xlsx")
+CT_GO.df_CF2$cluster <- "CF2"
+CT_GO.df_CF3 <- read.xlsx("CF3_GO_upregulated.xlsx")
+CT_GO.df_CF3$cluster <- "CF3"
+
+CT_GO.df_CF1_filtered <- dplyr::filter(CT_GO.df_CF1, !Description %in% CT_GO.df_CF2$Description & !Description %in% CT_GO.df_CF3$Description)
+CT_GO.df_CF2_filtered <- dplyr::filter(CT_GO.df_CF2, !Description %in% CT_GO.df_CF1$Description & !Description %in% CT_GO.df_CF3$Description)
+CT_GO.df_CF3_filtered <- dplyr::filter(CT_GO.df_CF3, !Description %in% CT_GO.df_CF1$Description & !Description %in% CT_GO.df_CF2$Description)
+
+CT_GO.df_CF1_down <- read.xlsx("CF1_GO_downregulated.xlsx")
+CT_GO.df_CF1_down$cluster <- "CF1"
+CT_GO.df_CF2_down <- read.xlsx("CF2_GO_downregulated.xlsx")
+CT_GO.df_CF2_down$cluster <- "CF2"
+CT_GO.df_CF3_down <- read.xlsx("CF3_GO_downregulated.xlsx")
+CT_GO.df_CF3_down$cluster <- "CF3"
+
+# For downregulated you just want to identify what is different to the upregulated. 
+CT_GO.df_CF1_down_filtered <- dplyr::filter(CT_GO.df_CF1_down, !Description %in% CT_GO.df_CF1$Description)
+CT_GO.df_CF2_down_filtered <- dplyr::filter(CT_GO.df_CF2_down, !Description %in% CT_GO.df_CF2$Description)
+CT_GO.df_CF3_down_filtered <- dplyr::filter(CT_GO.df_CF3_down, !Description %in% CT_GO.df_CF3$Description)
+
+
+CT_GO.df_CM_MalSham <- read.xlsx("CM_MalSham_GO_upregulated.xlsx")
+CT_GO.df_CM_MalSham$condition <- "Malonate Sham"
+CT_GO.df_CM_SalSham <- read.xlsx("CM_SalSham_GO_upregulated.xlsx")
+CT_GO.df_CM_SalSham$condition <- "Saline Sham"
+
+CT_GO.df_CM_SalSham_filtered <- dplyr::filter(CT_GO.df_CM_SalSham, !Description %in% CT_GO.df_CM_MalSham$Description)
+CT_GO.df_CM_MalSham_filtered <- dplyr::filter(CT_GO.df_CM_MalSham, !Description %in% CT_GO.df_CM_SalSham$Description)
+
+CT_GO.df_CM_MalMI <- read.xlsx("CM_MalMI_GO_upregulated.xlsx")
+CT_GO.df_CM_MalMI$condition <- "Malonate MI"
+CT_GO.df_CM_SalMI <- read.xlsx("CM_SalMI_GO_upregulated.xlsx")
+CT_GO.df_CM_SalMI$condition <- "Saline MI"
+
+CT_GO.df_CM_MalMI_filtered <- dplyr::filter(CT_GO.df_CM_MalMI, !Description %in% CT_GO.df_CM_SalMI$Description)
+CT_GO.df_CM_SalMI_filtered <- dplyr::filter(CT_GO.df_CM_SalMI, !Description %in% CT_GO.df_CM_MalMI$Description)
+
+CT_GO.df_CF_MalSham <- read.xlsx("CF_MalSham_GO_upregulated.xlsx")
+CT_GO.df_CF_MalSham$condition <- "Malonate Sham"
+CT_GO.df_CF_SalSham <- read.xlsx("CF_SalSham_GO_upregulated.xlsx")
+CT_GO.df_CF_SalSham$condition <- "Saline Sham"
+
+CT_GO.df_CF_SalSham_filtered <- dplyr::filter(CT_GO.df_CF_SalSham, !Description %in% CT_GO.df_CF_MalSham$Description)
+CT_GO.df_CF_MalSham_filtered <- dplyr::filter(CT_GO.df_CF_MalSham, !Description %in% CT_GO.df_CF_SalSham$Description)
+
+CT_GO.df_CF_MalMI <- read.xlsx("CF_MalMI_GO_upregulated.xlsx")
+CT_GO.df_CF_MalMI$condition <- "Malonate MI"
+CT_GO.df_CF_SalMI<- read.xlsx("CF_SalMI_GO_upregulated.xlsx")
+CT_GO.df_CF_SalMI$condition <- "Saline MI"
+
+CT_GO.df_CF_MalMI_filtered <- dplyr::filter(CT_GO.df_CF_MalMI, !Description %in% CT_GO.df_CF_SalMI$Description)
+CT_GO.df_CF_SalMI_filtered <- dplyr::filter(CT_GO.df_CF_SalMI, !Description %in% CT_GO.df_CF_MalMI$Description)
+
+CT_GO.df_EC_MalSham <- read.xlsx("EC_MalSham_GO_upregulated.xlsx")
+#CT_GO.df_EC_MalSham$condition <- "Malonate Sham" # No significant GO terms
+CT_GO.df_EC_SalSham <- read.xlsx("EC_SalSham_GO_upregulated.xlsx")
+CT_GO.df_EC_SalSham$condition <- "Saline Sham"
+
+CT_GO.df_EC_SalSham <- dplyr::filter(CT_GO.df_EC_SalSham, !Description %in% CT_GO.df_EC_MalSham$Description)
+CT_GO.df_EC_MalSham <- dplyr::filter(CT_GO.df_EC_MalSham, !Description %in% CT_GO.df_EC_SalSham$Description)
+
+CT_GO.df_EC_MalMI <- read.xlsx("EC_MalMI_GO_upregulated.xlsx")
+CT_GO.df_EC_MalMI$condition <- "Malonate MI"
+CT_GO.df_EC_SalMI<- read.xlsx("EC_SalMI_GO_upregulated.xlsx")
+CT_GO.df_EC_SalMI$condition <- "Saline MI"
+
+CT_GO.df_EC_MalMI_filtered <- dplyr::filter(CT_GO.df_EC_MalMI, !Description %in% CT_GO.df_EC_SalMI$Description)
+CT_GO.df_EC_SalMI_filtered <- dplyr::filter(CT_GO.df_EC_SalMI, !Description %in% CT_GO.df_EC_MalMI$Description)
+
+CT_GO.df_Mural_MalSham <- read.xlsx("Mural_MalSham_GO_upregulated.xlsx")
+#CT_GO.df_Mural_MalSham$condition <- "Malonate Sham" # No significant GO terms
+CT_GO.df_Mural_SalSham <- read.xlsx("Mural_SalSham_GO_upregulated.xlsx")
+CT_GO.df_Mural_SalSham$condition <- "Saline Sham"
+
+CT_GO.df_Mural_SalSham <- dplyr::filter(CT_GO.df_Mural_SalSham, !Description %in% CT_GO.df_Mural_MalSham$Description)
+CT_GO.df_Mural_MalSham <- dplyr::filter(CT_GO.df_Mural_MalSham, !Description %in% CT_GO.df_Mural_SalSham$Description)
+
+CT_GO.df_Mural_MalMI <- read.xlsx("Mural_MalMI_GO_upregulated.xlsx")
+CT_GO.df_Mural_MalMI$condition <- "Malonate MI"
+CT_GO.df_Mural_SalMI<- read.xlsx("Mural_SalMI_GO_upregulated.xlsx")
+CT_GO.df_Mural_SalMI$condition <- "Saline MI"
+
+CT_GO.df_Mural_MalMI_filtered <- dplyr::filter(CT_GO.df_Mural_MalMI, !Description %in% CT_GO.df_Mural_SalMI$Description)
+CT_GO.df_Mural_SalMI_filtered <- dplyr::filter(CT_GO.df_Mural_SalMI, !Description %in% CT_GO.df_Mural_MalMI$Description)
+
+CT_GO.df_Mye_MalSham <- read.xlsx("Mye_MalSham_GO_upregulated.xlsx")
+CT_GO.df_Mye_MalSham$condition <- "Malonate Sham"# No significant GO terms
+CT_GO.df_Mye_SalSham <- read.xlsx("Mye_SalSham_GO_upregulated.xlsx")
+CT_GO.df_Mye_SalSham$condition <- "Saline Sham"
+
+CT_GO.df_Mye_SalSham <- dplyr::filter(CT_GO.df_Mye_SalSham, !Description %in% CT_GO.df_Mye_MalSham$Description)
+CT_GO.df_Mye_MalSham <- dplyr::filter(CT_GO.df_Mye_MalSham, !Description %in% CT_GO.df_Mye_SalSham$Description)
+
+CT_GO.df_Mye_MalMI <- read.xlsx("Mye_MalMI_GO_upregulated.xlsx")
+CT_GO.df_Mye_MalMI$condition <- "Malonate MI"
+CT_GO.df_Mye_SalMI<- read.xlsx("Mye_SalMI_GO_upregulated.xlsx")
+CT_GO.df_Mye_SalMI$condition <- "Saline MI"
+
+CT_GO.df_Mye_MalMI_filtered <- dplyr::filter(CT_GO.df_Mye_MalMI, !Description %in% CT_GO.df_Mye_SalMI$Description)
+CT_GO.df_Mye_SalMI_filtered <- dplyr::filter(CT_GO.df_Mye_SalMI, !Description %in% CT_GO.df_Mye_MalMI$Description)
+```
+
+```{r echo=TRUE}
+##Merge DFs and remove unnecessary columns
+cols_keep <- c("ID","Description","GeneRatio","BgRatio","pvalue","p.adjust","qvalue","geneID","cluster")
+
+#For subcluster level analysis
+Sub_CM_GO_upreg <- rbind(CT_GO.df_CM1,CT_GO.df_CM2)
+Sub_CM_GO_upreg <- rbind(Sub_CM_GO_upreg,CT_GO.df_CM3)
+Sub_CM_GO_upreg <- Sub_CM_GO_upreg[,cols_keep]
+
+Sub_CM_GO_downreg <- rbind(CT_GO.df_CM1_down,CT_GO.df_CM2_down)
+Sub_CM_GO_downreg <- rbind(Sub_CM_GO_downreg,CT_GO.df_CM3_down)
+Sub_CM_GO_downreg <- Sub_CM_GO_downreg[,cols_keep]
+
+Sub_CF_GO_upreg <- rbind(CT_GO.df_CF1,CT_GO.df_CF2)
+Sub_CF_GO_upreg <- rbind(Sub_CF_GO_upreg,CT_GO.df_CF3)
+Sub_CF_GO_upreg <- Sub_CF_GO_upreg[,cols_keep]
+
+Sub_CF_GO_downreg <- rbind(CT_GO.df_CF1_down,CT_GO.df_CF2_down)
+Sub_CF_GO_downreg <- rbind(Sub_CF_GO_downreg,CT_GO.df_CF3_down)
+Sub_CF_GO_downreg <- Sub_CF_GO_downreg[,cols_keep]
+
+#For Condition analysis
+cols_keep <- c("ID","Description","GeneRatio","BgRatio","pvalue","p.adjust","qvalue","geneID","condition")
+
+Cond_CM_SalvMal_GO <- rbind(CT_GO.df_CM_SalSham,CT_GO.df_CM_MalSham)
+Cond_CM_SalvMal_GO <- rbind(Cond_CM_SalvMal_GO,CT_GO.df_CM_SalMI)
+Cond_CM_SalvMal_GO <- rbind(Cond_CM_SalvMal_GO,CT_GO.df_CM_MalMI)
+Cond_CM_SalvMal_GO <- Cond_CM_SalvMal_GO[,cols_keep]
+
+Cond_CF_SalvMal_GO <- rbind(CT_GO.df_CF_SalSham,CT_GO.df_CF_MalSham)
+Cond_CF_SalvMal_GO <- rbind(Cond_CF_SalvMal_GO,CT_GO.df_CF_SalMI)
+Cond_CF_SalvMal_GO <- rbind(Cond_CF_SalvMal_GO,CT_GO.df_CF_MalMI)
+Cond_CF_SalvMal_GO <- Cond_CF_SalvMal_GO[,cols_keep]
+
+Cond_EC_SalvMal_GO <- rbind(CT_GO.df_EC_SalSham,CT_GO.df_EC_MalSham)
+Cond_EC_SalvMal_GO <- rbind(Cond_EC_SalvMal_GO,CT_GO.df_EC_SalMI)
+Cond_EC_SalvMal_GO <- rbind(Cond_EC_SalvMal_GO,CT_GO.df_EC_MalMI)
+Cond_EC_SalvMal_GO <- Cond_EC_SalvMal_GO[,cols_keep]
+
+Cond_Mural_SalvMal_GO <- rbind(CT_GO.df_Mural_SalSham,CT_GO.df_Mural_MalSham)
+Cond_Mural_SalvMal_GO <- rbind(Cond_Mural_SalvMal_GO,CT_GO.df_Mural_SalMI)
+Cond_Mural_SalvMal_GO <- rbind(Cond_Mural_SalvMal_GO,CT_GO.df_Mural_MalMI)
+Cond_Mural_SalvMal_GO <- Cond_Mural_SalvMal_GO[,cols_keep]
+
+Cond_Mye_SalvMal_GO <- rbind(CT_GO.df_Mye_SalSham,CT_GO.df_Mye_MalSham)
+Cond_Mye_SalvMal_GO <- rbind(Cond_Mye_SalvMal_GO,CT_GO.df_Mye_SalMI)
+Cond_Mye_SalvMal_GO <- rbind(Cond_Mye_SalvMal_GO,CT_GO.df_Mye_MalMI)
+Cond_Mye_SalvMal_GO <- Cond_Mye_SalvMal_GO[,cols_keep]
+
+# Load the library
+library(writexl)
+
+# Create a named list of data frames 
+GO_df_list <- list("Subcluster CM upregulated" = Sub_CM_GO_upreg, "Subcluster CM downregulated" = Sub_CM_GO_downreg, "Subcluster CF upregulated" = Sub_CF_GO_upreg, "Subcluster CF downregulated" = Sub_CF_GO_downreg, "Condition CM Sal vs Mal" = Cond_CM_SalvMal_GO, "Condition CF Sal vs Mal" = Cond_CF_SalvMal_GO, "Condition EC Sal vs Mal" = Cond_EC_SalvMal_GO, "Condition Mural Sal vs Mal" = Cond_Mural_SalvMal_GO, "Condition Myeloid Sal vs Mal" = Cond_Mye_SalvMal_GO)
+
+# Write the entire list to an Excel file
+write_xlsx(GO_df_list, "Supplemental table 3 (GO).xlsx")
+
+```
+##Select GO Terms
+```{r echo=TRUE}
+CM1_upregulated_terms <- c("cardiac muscle hypertrophy"                             
+,"oxidative phosphorylation"                                   
+,"aerobic respiration"                                         
+,"positive regulation of fatty acid oxidation"                     
+,"ventricular cardiac muscle tissue development"               
+,"mitochondrial respiratory chain complex assembly"            
+,"cardiac ventricle morphogenesis"
+,"apoptotic mitochondrial changes" )
+
+CM2_upregulated_terms <- c("cardiac muscle hypertrophy"
+,"transforming growth factor beta receptor signaling pathway"
+,"extracellular matrix organization"                         
+,"negative regulation of growth"                             
+,"inflammasome-mediated signaling pathway"                       
+,"calcium ion transport"                                     
+,"positive regulation of muscle cell apoptotic process"      
+,"negative regulation of mitotic cell cycle" )
+
+CM3_upregulated_terms <- c("negative regulation of cardiac muscle hypertrophy"   
+,"fatty acid metabolic process"                        
+,"histone modification"                                
+,"cardiac muscle tissue development"                            
+,"positive regulation of cell cycle"                   
+,"regeneration"
+,"positive regulation of autophagy"                    
+,"regulation of glucose metabolic process" )
+
+CF3_upregulated_terms <- c("regulation of mRNA metabolic process"                    
+, "nucleocytoplasmic transport"                             
+, "negative regulation of extracellular matrix organization"
+, "regulation of collagen biosynthetic process"             
+,"histone modification"                                    
+,"cell-cell signaling by wnt"                   
+,"demethylation"                               
+, "positive regulation of BMP signaling pathway" )
+
+CF3_downregulated_terms <- c("fatty acid metabolic process"                     
+  , "extracellular matrix organization"                         
+  ,"collagen fibril organization"                                             
+  ,"transforming growth factor beta receptor signaling pathway"
+  ,"response to oxidative stress"                              
+  ,"negative regulation of growth"                             
+  ,"stress fiber assembly"                                     
+  ,"muscle cell differentiation"  )
+
+
+CF2_upregulated_terms <-c("extracellular matrix organization"
+,"collagen fibril organization"                               
+, "cardiac myofibril assembly"                                 
+,"positive regulation of striated muscle cell differentiation"
+,"cell-matrix adhesion"                                       
+,"positive regulation of cell activation"                                   
+,"muscle contraction"            
+,"physiological cardiac muscle hypertrophy")
+
+CF2_downregulated_terms <-c("regulation of generation of precursor metabolites and energy"
+  , "activation of innate immune response"               
+  ,"superoxide metabolic process"                                         
+  , "regulation of sprouting angiogenesis"                                 
+  ,"histone modification"                                   
+  ,"mRNA processing"                                                       
+  ,"positive regulation of BMP signaling pathway"                               
+  ,"negative regulation of cell cycle")  
+
+CF1_upregulated_terms <- c("fatty acid metabolic process"                            
+  ,"positive regulation of cell maturation"                    
+  ,"negative regulation of cell cycle G2/M phase transition"
+  ,"monocarboxylic acid biosynthetic process"            
+  ,"centrosome cycle"           
+  ,"fibroblast growth factor receptor signaling pathway"                
+  ,"Notch signaling pathway"  
+  ,"positive regulation of lipid localization")
+
+CF1_downregulated_terms <- c("wound healing"                            
+  ,"muscle organ morphogenesis"                    
+  ,"G2/M transition of mitotic cell cycle"
+  ,"cardiac muscle cell differentiation"            
+  ,"cell activation involved in immune response"           
+  ,"collagen fibril organization"                
+  ,"extracellular matrix assembly"  
+  ,"tissue remodeling")
+
+
+CM_SalSham_upregulated_terms <- c("oxidative phosphorylation" 
+  ,"aerobic respiration"                                                           
+  ,"tricarboxylic acid cycle"
+  ,"negative regulation of intrinsic apoptotic signaling pathway"                               
+  ,"regulation of cell growth"  )
+
+CM_MalSham_upregulated_terms <- c("cardiac muscle cell contraction" 
+  ,"histone modification"                                                           
+  ,"cardiac muscle cell proliferation"
+  ,"heart growth"                               
+  ,"regulation of sarcomere organization"  )
+
+CM_SalMI_upregulated_terms <- c("extracellular matrix organization" 
+  ,"negative regulation of canonical Wnt signaling pathway"       
+  ,"transforming growth factor beta receptor signaling pathway"
+  ,"tissue remodeling"                               
+  ,"immune response-activating signaling pathway"  )
+
+CM_MalMI_upregulated_terms <- c("histone modification" 
+  ,"oxidative phosphorylation"                                                           
+  ,"glucose metabolic process"
+  ,"cell proliferation involved in heart morphogenesis"                               
+  ,"positive regulation of mitotic cell cycle"  )
+
+CF_SalSham_upregulated_terms <- c("oxidative phosphorylation" 
+  ,"aerobic respiration"                                                           
+  ,"tricarboxylic acid cycle"
+  ,"cytoplasmic translation"                               
+  ,"regulation of cell-matrix adhesion"  )
+
+CF_MalSham_upregulated_terms <- c("heart valve morphogenesis" 
+  ,"positive regulation of animal organ morphogenesis"
+  ,"vascular endothelial growth factor production"
+  ,"positive regulation of vascular associated smooth muscle cell migration"                               
+  ,"mesenchyme morphogenesis"  )
+
+CF_SalMI_upregulated_terms <- c("cell-cell adhesion via plasma-membrane adhesion molecules"                 
+  ,"muscle tissue morphogenesis"                    
+  ,"extracellular matrix organization"                    
+  ,"mesenchymal cell proliferation"
+  ,"inflammatory response to wounding"  )
+
+CF_MalMI_upregulated_terms <-c("regulation of glucose metabolic process"     
+  , "histone modification"                              
+  ,"regulation of fibroblast proliferation"
+  ,"regulation of extracellular matrix organization" 
+  ,"regulation of MAP kinase activity")
+
+EC_SalSham_upregulated_terms <- c("cellular respiration" 
+  ,"cytoplasmic translation" 
+  ,"tricarboxylic acid cycle"
+  ,"regulation of RNA splicing"                               
+  ,"endothelial cell migration"  )
+
+EC_SalMI_upregulated_terms <- c("collagen fibril organization"             
+  ,"transforming growth factor beta production"   
+  ,"response to interferon-beta"
+  ,"acute inflammatory response"                  
+  ,"negative regulation of angiogenesis" )
+
+EC_MalMI_upregulated_terms <- c("aerobic respiration"
+,"generation of precursor metabolites and energy"                 
+,"endothelial cell activation"                                    
+,"regulation of cell migration involved in sprouting angiogenesis"
+,"morphogenesis of an endothelium")
+
+Mural_SalSham_upregulated_terms <- c("cellular respiration" 
+  ,"cytoplasmic translation" 
+  ,"tricarboxylic acid cycle"
+  ,"regulation of RNA splicing"                               
+  ,"regulation of smooth muscle cell proliferation"  )
+
+Mural_SalMI_upregulated_terms <- c("extracellular matrix organization"
+  , "muscle cell development"                                
+  ,"transforming growth factor beta production"             
+  ,"regulation of smooth muscle cell migration"             
+  ,"regulation of vascular permeability")
+
+Mural_MalMI_upregulated_terms <- c("chromatin remodeling"     
+  , "negative regulation of cardiac muscle hypertrophy"        
+  ,"cellular response to glucose stimulus"                    
+  ,"RNA splicing"
+  ,"regulation of cardiac muscle adaptation" )
+
+Mye_MalSham_upregulated_terms <- c("methylation")
+
+Mye_SalSham_upregulated_terms <- c("cellular respiration" 
+  ,"cytoplasmic translation" 
+  ,"tricarboxylic acid cycle"
+  ,"regulation of RNA splicing"                               
+  ,"myeloid cell homeostasis"  )
+
+Mye_MalMI_upregulated_terms <- c("generation of precursor metabolites and energy"    
+  ,"regulation of histone modification"                                       
+  ,"regulation of cardiac muscle hypertrophy"                                 
+  ,"heart growth"
+  ,"innate immune response activating cell surface receptor signaling pathway")
+
+Mye_SalMI_upregulated_terms <- c("extracellular matrix organization"                 
+,"regulation of mast cell activation involved in immune response"                 
+,"positive regulation of transforming growth factor beta receptor signaling pathway"
+,"negative regulation of innate immune response"
+,"positive regulation of acute inflammatory response"  )
+
+
+```
+## Plot GO terms
+```{r echo=TRUE}
+##Perform for each GO output and term list above
+ggplot(CT_GO.df_CM3[CT_GO.df_CM3$Description %in% CM3_upregulated_terms,], aes(x=log10p.adjusted, y= reorder(labels_wrapped,log10p.adjusted), color = qvalue,  size=Count)) +
+  geom_point() +
+  labs(title = "", x = "-10log[p.adjusted]", y = "") + scale_color_gradient(low="red", high="blue") +
+  theme(text = element_text(size=21))
+
+ggsave("CM3_GO_upregulated.tif",height = 5,width = 8)
+
+##Repeat for each cluster/condition
+
+```

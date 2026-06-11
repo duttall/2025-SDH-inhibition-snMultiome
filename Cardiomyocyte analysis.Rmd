@@ -1,0 +1,530 @@
+---
+title: "SDH inhibition snMultiome RNA & ATAC-seq"
+author: "Dakota Nuttall"
+date: "2025-06-17"
+R-version: 4.3.3
+---
+###Cardiomyocyte Analysis###
+
+```{r include=FALSE}
+set.seed(1234)
+library(Seurat)
+library(Signac)
+library(chromVAR)
+library(dplyr)
+library(reticulate)
+library(hdf5r)
+library(scales)
+library(ggplot2)
+library(openxlsx)
+library(readxl)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(org.Mm.eg.db)
+library(JASPAR2020)
+library(TFBSTools)
+library(harmony)
+library(pheatmap)
+library(EnhancedVolcano)
+library(ggrepel)
+library(tidyr)
+library(gridExtra)
+library(ggpubr)
+library(VennDiagram)
+library(extrafont)
+
+loadfonts(device = "win") # Use device="pdf" or "postscript" if needed
+
+```
+####  Load data  ####
+
+```{r echo=TRUE}
+#Load integrated file
+aggregated_samples <- readRDS("aggregated_global.rds")
+
+#Initial Subset Cardiomyocyte (CM) population
+aggregated_Cardiomyocytes <- subset(aggregated_samples, idents = "Cardiomyocytes")
+
+
+```
+
+###Re-normalize and re-run PCA analysis (repeat after contamination removal)
+
+```{r echo=TRUE}
+aggregated_Cardiomyocytes <- SCTransform(aggregated_Cardiomyocytes, vars.to.regress = c("percent.mt","percent.ribo"),vst.flavor = "v2", method = "glmGamPoi", variable.features.n = 5000)
+
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+
+#Establish new RNA, ATAC and WNN umaps
+aggregated_Cardiomyocytes <- RunPCA(aggregated_Cardiomyocytes, npcs = 50)
+aggregated_Cardiomyocytes <- RunHarmony(aggregated_Cardiomyocytes, 
+                              group.by.vars = "orig.ident",
+                              reduction = "pca", assay.use = "SCT", reduction.save = "harmony_pca",project.dim= F)
+aggregated_Cardiomyocytes <- FindNeighbors(object = aggregated_Cardiomyocytes, dims = 1:50, reduction = "harmony_pca")
+ElbowPlot(aggregated_Cardiomyocytes, reduction = "pca", ndims = 50)
+aggregated_Cardiomyocytes <- RunUMAP(aggregated_Cardiomyocytes, dims = 1:50, reduction = "harmony_pca",reduction.name = "umap_RNA", reduction.key = "UMAP")
+
+DefaultAssay(aggregated_Cardiomyocytes) <- "peakunion"
+
+aggregated_Cardiomyocytes <- FindTopFeatures(aggregated_Cardiomyocytes, min.cutoff = 10)
+aggregated_Cardiomyocytes<- RunTFIDF(aggregated_Cardiomyocytes,)
+aggregated_Cardiomyocytes <- RunSVD(aggregated_Cardiomyocytes)
+
+#Note: Harmony over-corrects for cell type level ATAC data so we stick with the default "lsi" reduction
+
+aggregated_Cardiomyocytes <- RunUMAP(object = aggregated_Cardiomyocytes, reduction = 'lsi', dims = 2:50, reduction.name = "umap_peakunion", reduction.key = "peakunionUMAP_")
+
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+ElbowPlot(aggregated_Cardiomyocytes, ndims = 50, reduction = "harmony_pca")# ~20-30
+FindDimNumber(aggregated_Cardiomyocytes,reduction = "lsi") #~45
+aggregated_Cardiomyocytes <- FindMultiModalNeighbors(
+  object = aggregated_Cardiomyocytes,
+  reduction.list = list("harmony_pca", "lsi"), 
+    dims.list = list(1:30, 2:45),
+  modality.weight.name = c("SCT.weight","peakunion.weight"),
+  verbose = TRUE
+)
+aggregated_Cardiomyocytes <- RunUMAP(
+  object = aggregated_Cardiomyocytes,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  reduction.name = "WNN_umap",
+  reduction.key = "WNN_UMAP_",
+  verbose = TRUE,
+)
+
+clust_colors <- c("darkorange2","mediumorchid2","steelblue3","olivedrab","indianred1","hotpink","darkred","green3","cyan")
+treatment_colors <-c("lightskyblue","pink", "steelblue4","red3")  
+
+```
+### Check for potential contamination (skip if already preformed)
+```{r echo=TRUE}
+
+aggregated_Cardiomyocytes<- FindClusters(aggregated_Cardiomyocytes, graph.name = "wsnn", algorithm = 3, resolution = seq(.1, 1, 0.1))
+
+#Check for potential contamination by using low resolution first 0.1, which only shows the clusters with the most variable gene expression
+Idents(aggregated_Cardiomyocytes) <- aggregated_Cardiomyocytes$wsnn_res.0.1
+quick_CT_plot(aggregated_Cardiomyocytes, 2,"WNN_umap",legend = F,label = T, font.size = 8)
+quick_cond_plot(aggregated_Cardiomyocytes, 2,"WNN_umap",legend = F)
+annotation_markers <- c("Myh6","Ttn","Tnnt2","Ryr2", #Cardiomyocytes
+                        "Col1a1","Postn","Pdgfra","Gsn","Htra3",#Cardiac Fibroblasts
+                        "Cdh5","Fabp4","Pecam1","Kdr",#Endothelial Cells
+                        "Rgs5","Kcnj8","P2ry14","Pdgfrb","Vtn",#Mural cells
+                        "Mrc1","Cd68","C1qa","Ms4a7","Ccr2","Cx3cr1",#Myeloid Cells
+                        "Cd79a","Ikzf3","Ms4a1","Skap1",#Lymphoid Cells
+                        "Upk3b","Upk1b","Clu","Dmkn",# Epicardial cells
+                        "Kcna1","Kcna2","Cdh19","Plp1")#Schwann cells
+
+DotPlot_SCT(aggregated_Cardiomyocytes, gene_vector = annotation_markers)
+
+contaminated <- Cells(subset(aggregated_Cardiomyocytes, idents = "1") )
+low_quality <- readLines("low_quality_BCs.txt")
+low_quality <- c(low_quality,contaminated)
+writeLines(low_quality, "low_quality_BCs+CM.txt")
+
+aggregated_Cardiomyocytes <- subset(aggregated_Cardiomyocytes, idents = "0") 
+## If contamination removed, repeat all steps after the initial subset
+
+
+```
+### Double check for contamination with higher resolution
+```{r echo=TRUE}
+
+aggregated_Cardiomyocytes<- FindClusters(aggregated_Cardiomyocytes, graph.name = "wsnn", algorithm = 3, resolution = seq(.1,.7,.1))
+
+Idents(aggregated_Cardiomyocytes) <- aggregated_Cardiomyocytes$wsnn_res.0.7
+quick_CT_plot(aggregated_Cardiomyocytes, 2,"WNN_umap",legend = F,label = T, font.size = 8)
+quick_cond_plot(aggregated_Cardiomyocytes, 2,"WNN_umap",legend = F)
+DotPlot_SCT(seurat_obj = aggregated_Cardiomyocytes, gene_vector = annotation_markers)
+
+### No clear
+
+```
+### Annotate and plot clusters (post contamination removal)
+```{r echo=TRUE}
+Idents(aggregated_Cardiomyocytes) <- aggregated_Cardiomyocytes$wsnn_res.0.7
+#Identify transcriptionally unique clusters 
+aggregated_Cardiomyocytes <- PrepSCTFindMarkers(aggregated_Cardiomyocytes, assay = "SCT",verbose = T)
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+CM_all_DEGs <- FindAllMarkers(aggregated_Cardiomyocytes, only.pos = T, min.pct = 0.3, logfc.threshold = .5, test.use = "MAST", recorrect_umi = F, assay = "SCT" )
+table(CM_all_DEGs$cluster)## Note: clusters 1 and 3 appear to relatively fewer distinguishing genes than 2 and 4. So they will be merged with cluster 0 to reduce cluster complexity and further emphasize the differences in 2 and 4.
+
+
+Cardiomyocytes_cell_types <- c("CM1","CM1","CM2","CM1","CM3") 
+aggregated_Cardiomyocytes@active.ident<-factor(aggregated_Cardiomyocytes@active.ident, labels = Cardiomyocytes_cell_types)
+
+Cardiomyocytes_cell_levels <- c("CM1","CM2","CM3")
+aggregated_Cardiomyocytes@active.ident<-factor(aggregated_Cardiomyocytes@active.ident, levels =  Cardiomyocytes_cell_levels)
+
+#Plot cells
+                                       
+quick_CT_plot(aggregated_Cardiomyocytes, 2,"WNN_umap",legend = F,label = T, font.size = 14)
+ggsave("Cardiomyocytes_umap_sub.tiff", height = 5,width = 5)
+quick_cond_plot(aggregated_Cardiomyocytes, 2,"WNN_umap",legend = F)
+ggsave("Cardiomyocytes_umap_cond.tiff", height = 5,width = 5)
+
+
+```
+## Find DEGs once again for Volcano plots and Gene Ontology (see GO script)
+
+```{r echo=TRUE}
+#Perform differential gene expression analysis comparing one cluster to all clusters simultaneously to find unique DEGs.
+aggregated_Cardiomyocytes <- PrepSCTFindMarkers(aggregated_Cardiomyocytes, assay = "SCT",verbose = T)
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+CM_all_DEGs <- FindAllMarkers(aggregated_Cardiomyocytes, only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT" ,return.thresh = 1)
+CM_all_DEGs$gene <- sub("\\..*", "", rownames(CM_all_DEGs))
+CM_all_DEGs <- CM_all_DEGs %>% group_by(cluster) %>% mutate(BH_p_val_adj = p.adjust(p_val, method = "BH")) 
+CM_all_DEGs <- CM_all_DEGs[!grepl("mt-",CM_all_DEGs$gene),]#Mitochondrial RNA is typically removed during nuclear exraction but some can be bound to ER during extraction so it is removed 
+CM_all_DEGs <- as.data.frame(CM_all_DEGs)
+CM_all_DEGs_sig <- subset(CM_all_DEGs, BH_p_val_adj < 0.05)
+write.xlsx(CM_all_DEGs_sig,"CM_all_DEGs_sig.xlsx")
+
+##For CM1
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+CM1_marker <- subset(CM_all_DEGs, cluster == "CM1")
+row.names(CM1_marker) <- CM1_marker$gene
+CM1_marker_sig <- subset(CM_all_DEGs_sig, cluster == "CM1" )
+row.names(CM1_marker_sig) <- CM1_marker_sig$gene
+
+lab_italics <- paste0("italic('", rownames(CM1_marker), "')")
+select_labels <-c(head(row.names(subset(CM1_marker, avg_log2FC > 0)),n=15),head(row.names(subset(CM1_marker, avg_log2FC < 0)),n=15))
+select_labels <- paste0("italic('",c(head(row.names(subset(CM1_marker, avg_log2FC > 0)),n=15),head(row.names(subset(CM1_marker, avg_log2FC < 0)),n=15)), "')")
+
+#find number of significant upregulated and downregulated genes
+
+up_down_volcano(CM1_marker, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("CM1 Upregulated Genes (",sum(CM1_marker_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("CM1 Downregulated Genes (",sum(CM1_marker_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "CM1_volcano.tiff", up_x = max(CM1_marker$avg_log2FC)+1.5,down_x = min(CM1_marker$avg_log2FC)-1 )
+
+##For CM2
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+CM2_marker <- subset(CM_all_DEGs, cluster == "CM2")
+CM2_marker <- CM2_marker[!duplicated(CM2_marker$gene), ] # "Pakap" gene has duplicate EnsembleIDs
+row.names(CM2_marker) <- CM2_marker$gene
+CM2_marker_sig <- subset(CM_all_DEGs_sig, cluster == "CM2" )
+CM2_marker_sig <- CM2_marker_sig[!duplicated(CM2_marker_sig$gene), ]
+row.names(CM2_marker_sig) <- CM2_marker_sig$gene
+
+lab_italics <- paste0("italic('", rownames(CM2_marker), "')")
+select_labels <-c(head(row.names(subset(CM2_marker, avg_log2FC > 0)),n=10), "Nppa","Nppb","Sorbs2","Myh7","Ccn2","Tgfb2",head(row.names(subset(CM2_marker, avg_log2FC < 0)),n=10))
+select_labels <- paste0("italic('",c(head(row.names(subset(CM2_marker, avg_log2FC > 0)),n=10), "Nppa","Nppb","Sorbs2","Myh7","Ccn2","Tgfb2",head(row.names(subset(CM2_marker, avg_log2FC < 0)),n=10)), "')")
+
+#find number of significant upregulated and downregulated genes
+
+#Note: Check and adjust label position with up_x and down_x as needed
+up_down_volcano(CM2_marker, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("CM2 Upregulated Genes (",sum(CM2_marker_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("CM2 Downregulated Genes (",sum(CM2_marker_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "CM2_volcano.tiff", up_x = max(CM2_marker$avg_log2FC)+1.5,down_x = min(CM2_marker$avg_log2FC)-1 )
+
+##For CM3
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+CM3_marker <- subset(CM_all_DEGs, cluster == "CM3")
+row.names(CM3_marker) <- CM3_marker$gene
+CM3_marker_sig <- subset(CM_all_DEGs_sig, cluster == "CM3" )
+row.names(CM3_marker_sig) <- CM3_marker_sig$gene
+
+lab_italics <- paste0("italic('", rownames(CM3_marker), "')")
+select_labels <-c(head(row.names(subset(CM3_marker, avg_log2FC > 0)),n=10), "Ezh1","Ccn1","Lrrc10","Tcap","Pdk4","Cited2","Ccnd3","Tecrl",head(row.names(subset(CM3_marker, avg_log2FC < 0)),n=10))
+select_labels <- paste0("italic('",c(head(row.names(subset(CM3_marker, avg_log2FC > 0)),n=10), "Ezh1","Ccn1","Lrrc10","Tcap","Pdk4","Cited2","Ccnd3","Tecrl",head(row.names(subset(CM3_marker, avg_log2FC < 0)),n=10)), "')")
+
+#find number of significant upregulated and downregulated genes
+
+up_down_volcano(CM3_marker, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("CM3 Upregulated Genes (",sum(CM3_marker_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("CM3 Downregulated Genes (",sum(CM3_marker_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "CM3_volcano.tiff", up_x = max(CM3_marker$avg_log2FC)+1.5,down_x = min(CM3_marker$avg_log2FC)-1 )
+
+#Compare DEG between individual clusters 
+
+CM1_DEG <- Comparison_DEG(aggregated_Cardiomyocytes,target_cluster = "CM1",comparison_clusters = c("CM2","CM3"))
+
+CM2_DEG <- Comparison_DEG(aggregated_Cardiomyocytes,target_cluster = "CM2",comparison_clusters = c("CM1","CM3"))
+
+CM3_DEG <- Comparison_DEG(aggregated_Cardiomyocytes,target_cluster = "CM3",comparison_clusters = c("CM1","CM2"))
+
+#save DEG results
+combined_DEGs <- c(CM1_DEG,CM2_DEG,CM3_DEG)
+combined_DEGs_df <-  do.call("rbind", combined_DEGs)
+
+write.xlsx(combined_DEGs_df,"CM_CT_compare_DEGs.xlsx",)
+
+#Plot DEGs of interest
+
+#CM2
+genes_of_interest <-c("Nppa","Nppb","Sorbs2","Myh7","Ccn2","Tgfb2")
+plot_DEGs(srt = aggregated_Cardiomyocytes,gene_list = genes_of_interest,comp_list = CM2_DEG,target_clust = "CM2",compare_clust = c("CM1","CM3"),x.font = 32)
+
+#CM3
+genes_of_interest <-c("Lifr","Ezh1","Ccn1","Lrrc10","Tcap","Pdk4","Cited2","Ccnd3","Tecrl","Foxo3","Sesn1","Foxo1")
+plot_DEGs(srt = aggregated_Cardiomyocytes,gene_list = genes_of_interest,comp_list = CM3_DEG,target_clust = "CM3",compare_clust = c("CM1","CM2"),x.font = 34)
+
+
+```
+## Treatment comparisons with MAST
+```{r echo=TRUE}
+#Perform differential expression analysis between treatment Sham and MI treatments using MAST
+
+CM_SalShamvMalSham  <- FindMarkers(aggregated_Cardiomyocytes, ident.1 = "Saline_Sham", ident.2 = "Malonate_Sham",group.by = "orig.ident",only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT",)
+    CM_SalShamvMalSham$BH_p_val_adj <- p.adjust(CM_SalShamvMalSham$p_val, method='BH')
+    CM_SalShamvMalSham$gene <- rownames(CM_SalShamvMalSham)
+    CM_SalShamvMalSham <- CM_SalShamvMalSham[!grepl("mt-",CM_SalShamvMalSham$gene),]
+    CM_SalShamvMalSham$comparison <- "Saline Sham vs Malonate Sham"
+CM_SalShamvMalSham_sig <- subset(CM_SalShamvMalSham, BH_p_val_adj < 0.05 )
+
+lab_italics <- paste0("italic('", rownames(CM_SalShamvMalSham), "')")
+select_labels <-c(head(row.names(subset(CM_SalShamvMalSham, avg_log2FC > 0)),n=15),head(row.names(subset(CM_SalShamvMalSham, avg_log2FC < 0)),n=10))
+select_labels <- paste0("italic('",c(head(row.names(subset(CM_SalShamvMalSham, avg_log2FC > 0)),n=15),head(row.names(subset(CM_SalShamvMalSham, avg_log2FC < 0)),n=10)), "')")
+
+up_down_volcano(CM_SalShamvMalSham, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("Saline Sham Upregulated Genes (",sum(CM_SalShamvMalSham_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("Malonate Sham upregulated Genes (",sum(CM_SalShamvMalSham_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "CM_SalShamvMalSham_volcano.tif", up_x = max(CM_SalShamvMalSham$avg_log2FC)+1.5,down_x = min(CM_SalShamvMalSham$avg_log2FC)-1.5,cols = c("pink2","lightskyblue3","grey" ))
+
+CM_SalMIvMalMI <- FindMarkers(aggregated_Cardiomyocytes, ident.1 = "Saline_MI", ident.2 = "Malonate_MI",group.by = "orig.ident",only.pos = F, min.pct = 0.05, logfc.threshold = .25, test.use = "MAST", recorrect_umi = F, assay = "SCT",)
+    CM_SalMIvMalMI$BH_p_val_adj <- p.adjust(CM_SalMIvMalMI$p_val, method='BH')
+    CM_SalMIvMalMI$gene <- rownames(CM_SalMIvMalMI)
+    CM_SalMIvMalMI <- CM_SalMIvMalMI[!grepl("mt-",CM_SalMIvMalMI$gene),]
+    CM_SalMIvMalMI$comparison <- "Saline MI vs Malonate MI"
+CM_SalMIvMalMI_sig <- subset(CM_SalMIvMalMI, BH_p_val_adj < 0.05 )
+
+lab_italics <- paste0("italic('", rownames(CM_SalMIvMalMI), "')")
+select_labels <-c(head(row.names(subset(CM_SalMIvMalMI, avg_log2FC > 0)),n=8),head(row.names(subset(CM_SalMIvMalMI, avg_log2FC < 0)),n=10))
+select_labels <- paste0("italic('",c(head(row.names(subset(CM_SalMIvMalMI, avg_log2FC > 0)),n=8) ,head(row.names(subset(CM_SalMIvMalMI, avg_log2FC < 0)),n=10)), "')")
+
+up_down_volcano(CM_SalMIvMalMI, selectLab =  select_labels,italicLab = lab_italics,up_label = paste("Saline MI Upregulated Genes (",sum(CM_SalMIvMalMI_sig$avg_log2FC > 0)," significant)", sep = ""),down_label = paste("Malonate MI upregulated Genes (",sum(CM_SalMIvMalMI_sig$avg_log2FC < 0)," significant)", sep = ""),volcano_name = "CM_SalMIvMalMI_volcano.tif", up_x = max(CM_SalMIvMalMI$avg_log2FC)+1,down_x = min(CM_SalMIvMalMI$avg_log2FC)-1,cols = c("red3","steelblue4","grey" ))
+
+#Save combined data
+combined_CM_DESeq <- rbind(CM_SalShamvMalSham_sig,CM_SalMIvMalMI_sig)
+write.xlsx(combined_CM_DESeq,"CM_Sal_vs_Mal_sig.xlsx")
+
+```
+## Identify upregulated ATAC peaks
+
+```{r echo=TRUE}
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+annotation <- renameSeqlevels(annotation, mapSeqlevels(seqlevels(annotation), "UCSC"))
+DefaultAssay(aggregated_Cardiomyocytes) <- 'peakunion'
+Annotation(aggregated_Cardiomyocytes) <- annotation
+
+library(ChIPseeker)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+
+annotated_peaks <- annotatePeak(
+  peak = granges(aggregated_Cardiomyocytes[["peakunion"]]),
+  TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene,
+  tssRegion = c(-2000, 2000),
+  annoDb = "org.Mm.eg.db"
+)
+
+annotated_peaks_df <- as.data.frame(annotated_peaks)
+
+# Add peak column to markers dataframe
+annotated_peaks_df$peak <- gsub(
+  ":|-",
+  "-",
+  paste0(
+    annotated_peaks_df$seqnames,
+    "-",
+    annotated_peaks_df$start,
+    "-",
+    annotated_peaks_df$end
+  )
+)
+
+
+# We will then perform differential analysis using linear regression to analyze ATAC Peaks as it can take into account the variance in nCount_ATAC and TSS.Enrichment between conditions
+
+CM1_peaks <- Comparison_peaks(aggregated_Cardiomyocytes,target_cluster = "CM1",comparison_clusters = c("CM2","CM3"),annotated_peaks_df = annotated_peaks_df)
+CM2_peaks <- Comparison_peaks(aggregated_Cardiomyocytes,target_cluster = "CM2",comparison_clusters = c("CM1","CM3"),annotated_peaks_df = annotated_peaks_df)
+CM3_peaks <- Comparison_peaks(aggregated_Cardiomyocytes,target_cluster = "CM3",comparison_clusters = c("CM1","CM2"), annotated_peaks_df = annotated_peaks_df)
+
+#save results
+combined_peaks <- c(CM1_peaks,CM2_peaks,CM3_peaks)
+combined_peaks_df <-  do.call("rbind", combined_peaks)
+
+write.xlsx(combined_peaks_df,"CM_CT_compare_peaks.xlsx",)
+
+#identify peaks that are nearby genes of interest
+CM3vCM1 <-data.frame(CM3_peaks$CM1$peak,CM3_peaks$CM1$gene_name,CM3_peaks$CM1$BH_p_val_adj, CM3_peaks$CM1$distance)
+CM3vCM1
+
+#Repeat for each comparison
+
+plot_peaks(srt = aggregated_Cardiomyocytes,nearest_genes = c("Pdk4","Ccnd3"),peaks_of_interest = c("chr6-5482155-5482792","chr17-47504903-47505217"),comp_list = CM3_peaks,target_clust = "CM3",compare_clust = c("CM1","CM2"), abbrev = "CM",x.font = 34)
+```
+## Motif analysis
+```{r echo=TRUE}
+#load motifs 
+pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+# first compute the GC content for each peak
+aggregated_Cardiomyocytes <- RegionStats(aggregated_Cardiomyocytes, genome = BSgenome.Mmusculus.UCSC.mm10)
+
+# add motifs to CM dataset
+
+aggregated_Cardiomyocytes <- AddMotifs(
+  object = aggregated_Cardiomyocytes,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  pfm = pfm,
+)
+
+##Analyze motif activity
+aggregated_Cardiomyocytes <- RunChromVAR(
+  object = aggregated_Cardiomyocytes,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  assay = "peakunion"
+)
+
+DefaultAssay(aggregated_Cardiomyocytes) <- "chromvar"
+
+da_peakunion_CM <- FindAllMarkers(
+  object = aggregated_Cardiomyocytes,
+  only.pos = TRUE,
+  mean.fxn = rowMeans,
+  fc.name = "avg_diff", logfc.threshold = .25
+)
+
+da_peakunion_CM$motif.names <-  ConvertMotifID(aggregated_Cardiomyocytes,assay = "peakunion",id =row.names(da_peakunion_CM))
+
+da_peakunion_CM<- na.omit(da_peakunion_CM)
+da_peakunion_CM$BH_p_val_adj <- p.adjust(da_peakunion_CM$p_val, method='BH')
+da_peakunion_CM <- subset(da_peakunion_CM, BH_p_val_adj < 0.05)
+write.xlsx(da_peakunion_CM, "Cardiomyocytes_motifs.xlsx")
+
+###Plot top CM1 motifs
+Motif_IDs <- head(da_peakunion_CM$gene[da_peakunion_CM$cluster == "CM1"],n=6)
+Motif_names <- head(da_peakunion_CM$motif.names[da_peakunion_CM$cluster == "CM1"],n=6)
+
+MotifPlot(
+  object = aggregated_Cardiomyocytes,
+  motifs = row.names(da_peakunion_CM[Motif_IDs,]), assay = "peakunion"
+)
+ggsave("CM1_top_motifs.tif", height = 5,width = 8)
+
+##Visualize individual motifs with violin plots and umaps
+CM1_motifs<-Comparison_motif(aggregated_Cardiomyocytes,target_cluster = "CM1",comparison_clusters = c("CM2","CM3"))
+
+index<- c(1:length(Motif_names))
+for(i in index){
+
+Comparison_violin_motif(seurat_obj = aggregated_Cardiomyocytes,target_cluster = "CM1",comparison_clusters = c("CM2","CM3"),feat = Motif_IDs[i],comparison_list = CM1_motifs,title = Motif_names[i],x.font.size = 36)
+
+ggsave(filename = paste("CM_",Motif_names[i],"_Motif_vln.tiff", sep = ""), height = 5, width = 5)
+
+p <- FeaturePlot(
+  object = aggregated_Cardiomyocytes,
+  features = Motif_IDs[i],
+  pt.size = 2,
+  reduction = "WNN_umap",
+  min.cutoff = 0, cols = c("lightgrey", "darkred")
+) + labs(title = Motif_names[i])+
+  theme(text=element_text(size=24),legend.text  = element_text( size = 16), axis.text=element_blank(),axis.ticks=element_blank(), axis.line = element_line(linewidth =  1))+ xlab(NULL) + ylab(NULL) +theme(axis.text=element_blank(),axis.title=element_text(size=20),legend.text  = element_text( size = 16),plot.title = element_text(face = "plain",size = 40))
+p
+ggsave(filename = paste("CM_",Motif_names[i],"_Motif_umap.tiff", sep = ""),plot = p, height = 5, width = 5)
+}
+
+#Plot TF RNA expression
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+genes_of_interest <- sapply(Motif_names, capitalize_first, USE.NAMES = FALSE)
+plot_DEGs(srt = aggregated_Cardiomyocytes,gene_list = genes_of_interest,comp_list = CM1_DEG,target_clust = "CM1",compare_clust = c("CM2","CM3"),x.font = 34)
+
+###Plot top CM2 motifs
+DefaultAssay(aggregated_Cardiomyocytes) <- "chromvar"
+Motif_IDs <- head(da_peakunion_CM$gene[da_peakunion_CM$cluster == "CM2"],n=6)
+Motif_names <- head(da_peakunion_CM$motif.names[da_peakunion_CM$cluster == "CM2"],n=6)
+Motif_names <- gsub(pattern = "::", replacement = "-", x = Motif_names)
+
+MotifPlot(
+  object = aggregated_Cardiomyocytes,
+  motifs = row.names(da_peakunion_CM[Motif_IDs,]), assay = "peakunion"
+)
+ggsave("CM2_top_motifs.tif", height = 5,width = 8)
+
+#Plot TF RNA expression
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+genes_of_interest <- sapply(c("BATF3","BATF","FOS","JUNB","SMAD2","SMAD3","JUN"), capitalize_first, USE.NAMES = FALSE)
+plot_DEGs(srt = aggregated_Cardiomyocytes,gene_list = genes_of_interest,comp_list = CM2_DEG,target_clust = "CM2",compare_clust = c("CM1","CM3"),x.font = 34)
+
+##Visualize individual motifs with violin plots and umaps
+DefaultAssay(aggregated_Cardiomyocytes) <- "chromvar"
+CM2_motifs<-Comparison_motif(aggregated_Cardiomyocytes,target_cluster = "CM2",comparison_clusters = c("CM1","CM3"))
+
+index<- c(1:length(Motif_names))
+for(i in index){
+
+Comparison_violin_motif(seurat_obj = aggregated_Cardiomyocytes,target_cluster = "CM2",comparison_clusters = c("CM1","CM3"),feat = Motif_IDs[i],comparison_list = CM2_motifs,title = Motif_names[i],x.font.size = 36)
+
+ggsave(filename = paste("CM_",Motif_names[i],"_Motif_vln.tiff", sep = ""), height = 5, width = 5)
+
+p <- FeaturePlot(
+  object = aggregated_Cardiomyocytes,
+  features = Motif_IDs[i],
+  pt.size = 2,
+  reduction = "WNN_umap",
+  min.cutoff = 0, cols = c("lightgrey", "darkred")
+) + labs(title = Motif_names[i])+
+  theme(text=element_text(size=24),legend.text  = element_text( size = 16), axis.text=element_blank(),axis.ticks=element_blank(), axis.line = element_line(linewidth =  1))+ xlab(NULL) + ylab(NULL) +theme(axis.text=element_blank(),axis.title=element_text(size=20),legend.text  = element_text( size = 16),plot.title = element_text(face = "plain",size = 40))
+p
+ggsave(filename = paste("CM_",Motif_names[i],"_Motif_umap.tiff", sep = ""),plot = p, height = 5, width = 5)
+}
+
+
+
+###Plot CM3 motifs of interest (main figure)
+DefaultAssay(aggregated_Cardiomyocytes) <- "chromvar"
+Motif_IDs <- c('MA0052.4','MA0660.1','MA0497.1','MA0773.1','MA0852.2','MA1103.2','MA0480.1','MA0157.2')
+Motif_names <- c("MEF2A","MEF2B","MEF2C","MEF2D","FOXK1","FOXK2","FOXO1","FOXO3")
+
+MotifPlot(
+  object = aggregated_Cardiomyocytes,
+  motifs = row.names(da_peakunion_CM[Motif_IDs,]), assay = "peakunion"
+)
+ggsave("CM3_top_motifs.tif", height = 5,width = 8)
+
+##Visualize individual motifs with violin plots and umaps
+CM3_motifs<-Comparison_motif(aggregated_Cardiomyocytes,target_cluster = "CM3",comparison_clusters = c("CM1","CM2"))
+
+
+index<- c(1:length(Motif_names))
+for(i in index){
+
+Comparison_violin_motif(seurat_obj = aggregated_Cardiomyocytes,target_cluster = "CM3",comparison_clusters = c("CM1","CM2"),feat = Motif_IDs[i],comparison_list = CM3_motifs,title = Motif_names[i],x.font.size = 36)
+
+ggsave(filename = paste("CM_",Motif_names[i],"_Motif_vln.tiff", sep = ""), height = 5, width = 5)
+
+p <- FeaturePlot(
+  object = aggregated_Cardiomyocytes,
+  features = Motif_IDs[i],
+  pt.size = 2,
+  reduction = "WNN_umap",
+  min.cutoff = 0, cols = c("lightgrey", "darkred")
+) + labs(title = Motif_names[i])+
+  theme(text=element_text(size=24),legend.text  = element_text( size = 16), axis.text=element_blank(),axis.ticks=element_blank(), axis.line = element_line(linewidth =  1))+ xlab(NULL) + ylab(NULL) +theme(axis.text=element_blank(),axis.title=element_text(size=20),legend.text  = element_text( size = 16),plot.title = element_text(face = "plain",size = 40))
+p
+ggsave(filename = paste("CM_",Motif_names[i],"_Motif_umap.tiff", sep = ""),plot = p, height = 5, width = 5)
+}
+
+#Plot TF RNA expression
+DefaultAssay(aggregated_Cardiomyocytes) <- "SCT"
+genes_of_interest <- sapply(Motif_names, capitalize_first, USE.NAMES = FALSE)
+plot_DEGs(srt = aggregated_Cardiomyocytes,gene_list = genes_of_interest,comp_list = CM3_DEG,target_clust = "CM3",compare_clust = c("CM1","CM2"),x.font = 34)
+
+#Save motif data
+combined_motifs <- c(CM1_motifs,CM2_motifs,CM3_motifs)
+combined_motifs_df <-  do.call("rbind", combined_motifs)
+combined_motifs_df$motif.names <-  ConvertMotifID(aggregated_Cardiomyocytes,assay = "peakunion",id =combined_motifs_df$motif.ID)
+
+write.xlsx(combined_motifs_df,"CM_CT_compare_motifs.xlsx",)
+
+motif_list <- list("CM all" = da_peakunion_CM, "CM comparisons" = combined_motifs_df) 
+
+# Write the entire list to an Excel file
+write.xlsx(motif_list, "Supplemental table 7 (motifs).xlsx")
+  
+```
+## Proportion plots and subcluster heatmaps
+```{r echo=TRUE}
+
+aggregated_Cardiomyocytes$Cell_state <- Idents(aggregated_Cardiomyocytes)
+#These functions can be found in the helper functions script
+proportion_plots(aggregated_Cardiomyocytes, cond_color = treatment_colors, clust_color = clust_colors, name.clust = "CM_prop_sub.tif", name.cond = "CM_prop_cond.tif",height = 4, width = 4)
+
+prop_heatmap(aggregated_Cardiomyocytes, "CM_heat_prop.tif")
+
+#Save dataset
+saveRDS(aggregated_Cardiomyocytes,"Cardiomyocytes.rds")
+```
+
